@@ -265,19 +265,21 @@ def run_passes(cfg, W, passes, k=None, Wtr=None):
             todo.append(p)
     allq = np.arange(W['NQ'])
     keycache = {}
-    for p in [x for x in todo if x in B.KEY_PASSES]:
+    save = lambda ps: [out[p].to_parquet(os.path.join(W['dir'], pass_key(cfg, W, p) + '.parquet'), index=False) for p in ps]
+    for p in [x for x in todo if x in B.KEY_PASSES]:        # each pass is cached as soon as it is done (restart-safe)
         with Timer(f'pass {p}'):
             out[p] = B.key_pass(p, W['Q'], W['P'], allq, cfg['block']['max_block'], keycache)
+        save([p])
     sparse = [x for x in todo if x in B.SPARSE_PASSES]
     if sparse:
         with Timer(f'passes {sparse}'):
             out.update(B.sparse_passes(W['Qm'], W['Pm'], allq, W['q_ck'], W['p_slices'], W['R'], k, sparse, cfg))
+        save(sparse)
     for p in [x for x in todo if x in B.DENSE_PASSES]:
         Qe, Pe = get_embeddings(cfg, W, 'embG' if p == 'G' else 'embS', Wtr)
         with Timer(f'pass {p}'):
             out[p] = B.dense_pass(Qe, Pe, allq, W['q_ck'], W['p_slices'], k)
-    for p in todo:
-        out[p].to_parquet(os.path.join(W['dir'], pass_key(cfg, W, p) + '.parquet'), index=False)
+        save([p])
     return out
 
 
