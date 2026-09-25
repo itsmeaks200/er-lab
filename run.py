@@ -48,7 +48,7 @@ def main():
     from erlab.experiments import run_experiment
     if a.cmd == 'overnight':
         ids, a.set, a.keep_going = OVERNIGHT['ids'], OVERNIGHT['sets'] + a.set, True
-        print(f"overnight plan: {' '.join(ids)} | settings: {' '.join(a.set)}", flush=True)
+        print(f"overnight plan: {' '.join(ids)}" + (f" | settings: {' '.join(a.set)}" if a.set else ''), flush=True)
     elif a.cmd == 'exp':
         ids = a.ids
     else:

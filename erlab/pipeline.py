@@ -218,6 +218,21 @@ def get_embeddings(cfg, W, name, Wtr=None):
     pq, pp = os.path.join(W['dir'], f'{name}_{key}_Q.npy'), os.path.join(W['dir'], f'{name}_{key}_P.npy')
     if os.path.exists(pq) and os.path.exists(pp):
         return np.load(pq), np.load(pp)
+    shared = name == 'embS' and not cfg['st']['finetune']     # raw-text embeddings of the pool: identical across worlds
+    if shared and not os.path.exists(pp):
+        import glob
+        for f in glob.glob(os.path.join(cfg['paths']['cache_dir'], f"{W['split']}_*", f'{name}_{key}_P.npy')):
+            if os.path.dirname(f) != W['dir'] and _pool_sig(os.path.dirname(f)) == _pool_sig(W['dir']):
+                log(f'   reusing pool embeddings from {os.path.basename(os.path.dirname(f))}')
+                np.save(pp, np.load(f))
+                break
+    if shared and os.path.exists(pp):
+        from . import encoders as E
+        sc = cfg['st']
+        with Timer(f'embeddings {name} on {W["split"]} world (queries only; pool reused)'):
+            Qe = E.embed_st(get_st_model(cfg, Wtr if Wtr is not None else W), E.st_texts(W['Q'], sc['prefix']), sc['batch'])
+        np.save(pq, Qe)
+        return Qe, np.load(pp)
     with Timer(f'embeddings {name} on {W["split"]} world'):
         if name == 'embG':
             model = get_hash_encoder(cfg, Wtr if Wtr is not None else W)
@@ -231,6 +246,14 @@ def get_embeddings(cfg, W, name, Wtr=None):
             Pe = E.embed_st(model, E.st_texts(W['P'], sc['prefix']), sc['batch'])
     np.save(pq, Qe); np.save(pp, Pe)
     return Qe, Pe
+
+
+def _pool_sig(d):
+    """Signature of a world's pool (ids in order) to decide whether cached pool embeddings can be shared."""
+    P = pd.read_parquet(os.path.join(d, 'P.parquet'), columns=['entity_id'])
+    ids = P.entity_id.astype(str)
+    return (len(ids), cfg_hash([ids.iloc[:1000].tolist(), ids.iloc[-1000:].tolist(),
+                                int(pd.util.hash_pandas_object(ids, index=False).sum() % (1 << 61))]))
 
 
 def get_st_model(cfg, Wtr):

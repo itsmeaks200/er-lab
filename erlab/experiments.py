@@ -150,7 +150,7 @@ def stage1_ctxs(cfg, W, pdfs, blk, plan, S1, info, prms, key):
             cand, F = PL.subset_context(cand_u, F_u, np.flatnonzero(mk[U]), plan['passes'])
         y = PL.label_candidates(W, cand)
         keys = cand.qi.to_numpy(np.int64) * W['NP'] + cand.pi.to_numpy(np.int64)
-        st = dict(cut=prm, info=info, model=S1['model'], cols=S1['cols'], imp=S1['imp'],
+        st = dict(key=S1['key'], cut=prm, info=info, model=S1['model'], cols=S1['cols'], imp=S1['imp'],
                   stats=PL.cand_stats(W, f"stage 1 cut {prm}", keys))
         yield make_ctx(cfg, W, pdfs, blk, plan, cand, F, y, key + '_' + cfg_hash(prm), dict(stage1_cut=prm), st)
 
@@ -426,8 +426,7 @@ def _oof_p1(ctx, mcfg, feats, n_folds=2):
     for k in range(n_folds):
         trk, prk = tr[h[tr] != k], fit[h[fit] == k]
         mk = Model(mcfg['kind'], mcfg['params'], rounds, 10 ** 9, ctx.cfg['seed'], feats)
-        mk.fit(X_of(ctx, trk, feats), ctx.y[trk], ctx.qi[trk], X_of(ctx, ctx.rows['tune'][:1000], feats),
-               ctx.y[ctx.rows['tune'][:1000]], ctx.qi[ctx.rows['tune'][:1000]])
+        mk.fit_fixed(X_of(ctx, trk, feats), ctx.y[trk], ctx.qi[trk])
         p1[prk] = mk.predict(X_of(ctx, prk, feats))
     return p1, full
 
@@ -566,6 +565,23 @@ def run_submit(cfg, rep, args):
 
 
 RUNNERS['submit'] = run_submit
+
+
+def run_summary(cfg, rep, args):
+    sp = os.path.join(cfg['paths']['results_dir'], 'submissions', 'SUMMARY.csv')
+    if not os.path.exists(sp):
+        rep.text('no approach has finished yet', short=True)
+        return
+    df = pd.read_csv(sp).drop_duplicates('exp', keep='last').sort_values('hold_F05', ascending=False).set_index('exp')
+    rep.table('APPROACH LEADERBOARD (holdout F0.5; each folder has matching_results.tsv + candidate_pairs.tsv)',
+              df.drop(columns=['folder']), short=True, short_rows=20)
+    best = df.index[0]
+    rep.text(f"best on holdout: **{best}** ({df.loc[best, 'desc']}) F0.5 {df.loc[best, 'hold_F05']:.5f} → upload "
+             f"{df.loc[best, 'folder']}/matching_results.tsv", short=True)
+    rep.metric(best=best, best_hold_F05=float(df.loc[best, 'hold_F05']))
+
+
+RUNNERS['summary'] = run_summary
 
 
 def run_experiment(exp_id, spec, cli_sets, base_over=None):

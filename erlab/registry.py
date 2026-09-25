@@ -76,16 +76,56 @@ EXPERIMENTS = {
 }
 
 
-# `python run.py overnight`: everything on the FULL train S1 set with stage-1 learned blocking + e5, in priority order,
-# so that the most useful results (and a submission) exist even if the night is cut short. All experiments share one
-# cached context (world, passes, stage-1 survivors, matcher features), so each model only costs its own training.
+# ------------------------------------------------------------------ approach pipelines (each: holdout → refit → test)
+# Every approach writes results/submissions/<ID>/{holdout.json, matching_results.tsv, candidate_pairs.tsv, submission_meta.json}
+# and appends one row to results/submissions/SUMMARY.csv. All share: full train S1 set, stage 0 (keys + TF-IDF + hash
+# encoder + e5-small), stage-1 learned blocking with per-pool-record context, the leak-free 'enc' fold.
+FULL = {'world': {'n_s1_sample': 10 ** 9}, 'st': {'enabled': True}, 'prune1': {'enabled': True, 'pool_ctx': True}}
+CE_SMALL = {'crossenc': {'enabled': True, 'model': 'intfloat/multilingual-e5-small', 'max_len': 96, 'batch': 256, 'lr': 3e-5,
+                         'max_train_pairs': 2_000_000, 'band': [0.005, 0.995], 'top_n': 12, 'max_pred_pairs': 4_000_000,
+                         'train_minutes': 60, 'pred_batch': 1024}}
+CE_LARGE = {'crossenc': {'enabled': True, 'model': 'intfloat/multilingual-e5-large', 'max_len': 64, 'batch': 32, 'lr': 1.5e-5,
+                         'max_train_pairs': 400_000, 'band': [0.02, 0.98], 'top_n': 8, 'max_pred_pairs': 1_500_000,
+                         'train_minutes': 75, 'pred_batch': 256}}
+
+
+def _deep(*ds):
+    from .config import deep_merge
+    out = {}
+    for d in ds:
+        out = deep_merge(out, d)
+    return out
+
+
+EXPERIMENTS.update({
+    'SUB1': dict(wave=5, kind='submit', desc='A1: LightGBM matcher on stage-1 candidates',
+                 cfg=FULL, args=dict(models=[dict(kind='lgb', params={})])),
+    'SUB2': dict(wave=5, kind='submit', desc='A2: GBDT trio LightGBM + XGBoost + CatBoost (averaged probabilities)',
+                 cfg=FULL, args=dict(models=[dict(kind='lgb', params={}), dict(kind='xgb', params={}), dict(kind='cat', params={})])),
+    'SUB3': dict(wave=5, kind='submit', desc='A3: LightGBM + stage-2 cross-source reranker (OOF stacking)',
+                 cfg=FULL, args=dict(models=[dict(kind='lgb', params={})], stage2=True)),
+    'SUB4': dict(wave=5, kind='submit', desc='A4: A3 + multilingual-e5-small cross-encoder (trained on the enc fold) stacked',
+                 cfg=_deep(FULL, CE_SMALL), args=dict(models=[dict(kind='lgb', params={})], stage2=True, crossenc=True)),
+    'SUB5': dict(wave=5, kind='submit', desc='A5: A3 + LARGE multilingual-e5-large (560M, MIT) cross-encoder stacked',
+                 cfg=_deep(FULL, CE_LARGE), args=dict(models=[dict(kind='lgb', params={})], stage2=True, crossenc=True)),
+    'SUB6': dict(wave=5, kind='submit', desc='A6: LightGBM with Optuna-tuned params (from M12)',
+                 cfg=FULL, args=dict(models=[dict(kind='lgb', params={}, params_file='M12_best_params.json')])),
+    'SUMMARY': dict(wave=5, kind='summary', desc='approach leaderboard (holdout F0.5) from results/submissions/SUMMARY.csv'),
+})
+EXPERIMENTS['M12']['args'] = dict(trials=30)
+
+# `python run.py overnight` (10-12 h): approaches in priority order so that the most useful results and valid
+# submissions exist even if the night is cut short. One process, one cached context: each approach only pays for its
+# own models; the test candidates/features are built once (first approach) and reused.
 OVERNIGHT = dict(
-    ids=['P02',                    # stage-1 frontier: matcher F0.5 vs candidates/S1 (leak-free encoder fold)
-         'M01', 'S03',             # LightGBM baseline + first test submission (results/submission/*.tsv)
-         'M05', 'M06', 'M04',      # XGBoost, CatBoost, lambdarank
-         'M11', 'M12', 'N03',      # stage-2 cross-source reranker, Optuna HPO, cross-encoder on all survivors
-         'M02', 'M03', 'M07', 'M08',
-         'M09', 'M10', 'D01',      # blend of all members, feature-group ablation, decision-rule deep dive
-         'N04'],                   # LARGE cross-encoder (multilingual-e5-large, 560M, MIT) last: slowest, capped ~2.5 h
-    sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True'],
+    ids=['SUB1',        # A1 LightGBM                                   → first holdout score + submission
+         'SUB3',        # A3 + stage-2 cross-source reranker
+         'SUB4',        # A4 + e5-small cross-encoder
+         'SUB2',        # A2 GBDT trio
+         'M12', 'SUB6',  # Optuna (30 trials) → A6 tuned LightGBM
+         'SUMMARY',
+         'P02',         # analysis: matcher F0.5 vs candidates/S1 frontier
+         'SUB5',        # A5 + LARGE e5-large cross-encoder (slowest, last)
+         'SUMMARY'],
+    sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True'],   # = FULL
 )

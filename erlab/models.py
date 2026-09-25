@@ -91,6 +91,40 @@ class Model:
             raise ValueError(k)
         return self
 
+    def fit_fixed(self, Xtr, ytr, gtr=None):
+        """Train exactly self.rounds rounds without a validation set (refit on all labelled rows after the holdout
+        phase, and out-of-fold models): no early stopping on a tiny or in-sample validation set."""
+        k, p = self.kind, dict(self.params)
+        rounds = max(1, int(self.rounds))
+        if k in ('lgb', 'lgb_rank'):
+            import lightgbm as lgb
+            p.update(seed=self.seed, num_threads=os.cpu_count())
+            p.pop('eval_at', None)
+            self.obj = lgb.train(p, lgb.Dataset(Xtr, ytr, group=_group_sizes(gtr) if k == 'lgb_rank' else None),
+                                 num_boost_round=rounds)
+            self.best_iter = rounds
+        elif k == 'xgb':
+            import xgboost as xgb
+            p['seed'] = self.seed
+            if _gpu():
+                if int(xgb.__version__.split('.')[0]) >= 2:
+                    p['device'] = 'cuda'
+                else:
+                    p['tree_method'] = 'gpu_hist'
+            p['nthread'] = os.cpu_count()
+            self.obj = xgb.train(p, xgb.DMatrix(Xtr, ytr, missing=np.nan), rounds)
+            self.best_iter = rounds - 1
+        elif k == 'cat':
+            from catboost import CatBoostClassifier
+            self.obj = CatBoostClassifier(iterations=rounds, random_seed=self.seed, task_type='GPU' if _gpu() else 'CPU',
+                                          thread_count=os.cpu_count(), verbose=500,
+                                          train_dir=os.path.join(os.environ.get('ER_CACHE', './cache'), 'catboost_info'), **p)
+            self.obj.fit(Xtr, ytr)
+            self.best_iter = rounds
+        else:                                   # lr / mlp: no early stopping anyway
+            self.fit(Xtr, ytr, gtr, None, None, None)
+        return self
+
     def predict(self, X):
         k = self.kind
         if k in ('lgb', 'lgb_rank'):

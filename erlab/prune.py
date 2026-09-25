@@ -133,7 +133,7 @@ def fit_pruner(X, y, qi, rows, q_hash, pc, seed=42):
     h = q_hash[qi]
     for k in range(2):
         trk, prk = tr[h[tr] != k], fit[h[fit] == k]
-        mk = Model('lgb', params, rounds, 10 ** 9, seed).fit(X[trk], y[trk], None, X[va[:1000]], y[va[:1000]], None)
+        mk = Model('lgb', params, rounds, 10 ** 9, seed).fit_fixed(X[trk], y[trk])
         p[prk] = predict_rows(mk, X, prk)
     return p, full
 
