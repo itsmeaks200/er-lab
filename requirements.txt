@@ -1,5 +1,5 @@
 # core (CPU)
-numpy>=1.24
+numpy>=1.24,<2.4         # numba does not support numpy 2.4 yet
 pandas>=2.0
 pyarrow>=12
 scipy>=1.10
