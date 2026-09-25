@@ -6,6 +6,7 @@
   python run.py exp ENV                           # environment check
   python run.py exp SMOKE --data ./mini_data      # end-to-end in minutes
   python run.py wave 1                            # run every experiment of a wave (in order)
+  python run.py overnight                         # full-data plan: stage-1 frontier, model zoo, HPO, cross-encoder, submission
   python run.py exp M01 M02 --set model.rounds=3000 world.n_s1_sample=400000
 Afterwards: cat results/PASTE_BACK.md  → paste into the chat.
 Global options: --data DIR (or env ER_DATA), --cache DIR (ER_CACHE), --results DIR (ER_RESULTS), --jobs N (ER_JOBS)
@@ -22,7 +23,7 @@ def main():
         except Exception:
             pass
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['list', 'exp', 'wave', 'make-mini'])
+    ap.add_argument('cmd', choices=['list', 'exp', 'wave', 'make-mini', 'overnight'])
     ap.add_argument('ids', nargs='*')
     ap.add_argument('--data'); ap.add_argument('--cache'); ap.add_argument('--results'); ap.add_argument('--jobs', type=int)
     ap.add_argument('--out', default='./mini_data')
@@ -35,7 +36,7 @@ def main():
     if a.results: os.environ['ER_RESULTS'] = a.results
     if a.jobs: os.environ['ER_JOBS'] = str(a.jobs)
 
-    from erlab.registry import EXPERIMENTS, SMOKE_CFG
+    from erlab.registry import EXPERIMENTS, SMOKE_CFG, OVERNIGHT
     if a.cmd == 'list':
         for k, v in EXPERIMENTS.items():
             print(f"wave {v['wave']}  {k:6s} [{v['kind']:8s}] {v['desc']}")
@@ -45,7 +46,10 @@ def main():
         make_mini_dataset(os.environ.get('ER_DATA', './dataset'), a.out)
         return 0
     from erlab.experiments import run_experiment
-    if a.cmd == 'exp':
+    if a.cmd == 'overnight':
+        ids, a.set, a.keep_going = OVERNIGHT['ids'], OVERNIGHT['sets'] + a.set, True
+        print(f"overnight plan: {' '.join(ids)} | settings: {' '.join(a.set)}", flush=True)
+    elif a.cmd == 'exp':
         ids = a.ids
     else:
         waves = {int(x) for x in a.ids}
@@ -58,7 +62,7 @@ def main():
         print(f'\n==================== {i}: {EXPERIMENTS[i]["desc"]}', flush=True)
         ok = run_experiment(i, EXPERIMENTS[i], a.set, SMOKE_CFG if a.smoke else None)
         ok_all &= ok
-        if not ok and not a.keep_going and a.cmd == 'wave':
+        if not ok and not a.keep_going and a.cmd in ('wave', 'overnight'):
             print('stopping wave after failure (use --keep-going to continue)')
             break
     res = os.environ.get('ER_RESULTS', './results')

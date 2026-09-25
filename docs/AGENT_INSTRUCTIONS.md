@@ -44,6 +44,14 @@ P01 uses a 300k-S1 world; P02 uses ALL ~2.2M train S1 (needed for its per-pool-r
 memory-hungry one. Do NOT shrink `world.n_s1_sample` for P02 if it runs out of memory; report the error instead.
 Afterwards print `results/PASTE_BACK.md`.
 
+## Overnight run (everything, full data, ~8-10 h)
+```powershell
+Start-Process python -ArgumentList 'run.py','overnight' -RedirectStandardOutput overnight.log -RedirectStandardError overnight.err -WindowStyle Hidden
+```
+Runs P02 → M01 → S03 (submission) → XGB/CatBoost/rank → stage 2 / Optuna / cross-encoder → other models → blend / ablation /
+decision rules, continuing after failures. `results/PASTE_BACK.md` collects every experiment; the submission lands in
+`results/submission/`. Check with `Get-Content overnight.log -Tail 5` (ends with `DONE.`).
+
 ## Step 3+: the real waves (only when I say which one)
 ```bash
 python run.py wave 1 --keep-going          # blocking      (first run builds caches: ~1-2 h)

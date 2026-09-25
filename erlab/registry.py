@@ -58,6 +58,8 @@ EXPERIMENTS = {
                 cfg={'st': {'enabled': True}}),
     'N02': dict(wave=3, kind='stage2', desc='stage 2 + Ditto-style cross-encoder on the uncertain band',
                 cfg={'crossenc': {'enabled': True}}, args=dict(crossenc=True)),
+    'N03': dict(wave=3, kind='stage2', desc='stage 2 + cross-encoder on ALL stage-1 survivors (affordable: ~5 cands/S1)',
+                cfg={'crossenc': {'enabled': True, 'band': [0.0, 1.0], 'top_n': 50}}, args=dict(crossenc=True)),
     # ------------------------------------------------------------------ wave 4: submission
     'S01': dict(wave=4, kind='submit', desc='final: LightGBM baseline + best rule → test submission',
                 args=dict(models=[dict(kind='lgb', params={})])),
@@ -67,3 +69,17 @@ EXPERIMENTS = {
     'S02': dict(wave=4, kind='submit', desc='final: stage-2 cross-source reranker → test submission',
                 args=dict(models=[dict(kind='lgb', params={})], stage2=True)),
 }
+
+
+# `python run.py overnight`: everything on the FULL train S1 set with stage-1 learned blocking + e5, in priority order,
+# so that the most useful results (and a submission) exist even if the night is cut short. All experiments share one
+# cached context (world, passes, stage-1 survivors, matcher features), so each model only costs its own training.
+OVERNIGHT = dict(
+    ids=['P02',                    # stage-1 frontier: matcher F0.5 vs candidates/S1 (leak-free encoder fold)
+         'M01', 'S03',             # LightGBM baseline + first test submission (results/submission/*.tsv)
+         'M05', 'M06', 'M04',      # XGBoost, CatBoost, lambdarank
+         'M11', 'M12', 'N03',      # stage-2 cross-source reranker, Optuna HPO, cross-encoder on all survivors
+         'M02', 'M03', 'M07', 'M08',
+         'M09', 'M10', 'D01'],     # blend of all members, feature-group ablation, decision-rule deep dive
+    sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True'],
+)

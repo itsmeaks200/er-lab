@@ -33,8 +33,16 @@ def _cache(cfg, *parts):
 
 # ============================================================ worlds
 def world_key(cfg, split):
-    return f"{split}_" + cfg_hash(dict(w=cfg['world'], v=cfg['vec'], data=os.path.abspath(cfg['paths']['data_dir']),
-                                       ver=3))
+    w = {k: v for k, v in cfg['world'].items() if k != 'enc_frac'}      # the enc split is applied after loading
+    return f"{split}_" + cfg_hash(dict(w=w, v=cfg['vec'], data=os.path.abspath(cfg['paths']['data_dir']), ver=3))
+
+
+ENC_HASH_KEY = 'erlab-enc-split1'   # 16 chars; independent of the fit/tune/hold hash
+
+
+def enc_fold_name(cfg):
+    """Fold whose true pairs train the learned encoders (hash encoder, fine-tuned sentence-transformer)."""
+    return 'enc' if cfg['world'].get('enc_frac', 0) > 0 else 'fit'
 
 
 def _save_frame(df, path, cols):
@@ -87,6 +95,10 @@ def _finish_world(W, cfg, d):
     W['p_slices'] = D.country_slices(W['P'])
     W['R'] = V.fit_idf(W['Pm'], cfg)
     if 'gt_qi' in W:
+        ef = cfg['world'].get('enc_frac', 0)
+        if ef > 0:                  # move part of fit to 'enc' (deterministic hash of the S1 id)
+            h = pd.util.hash_array(W['Q'].entity_id.astype(object).to_numpy(), hash_key=ENC_HASH_KEY) % 10_000 / 10_000
+            W['q_fold'] = np.where((W['q_fold'] == 'fit') & (h < ef), 'enc', W['q_fold']).astype(object)
         W['gt_keys'] = W['gt_qi'].astype(np.int64) * W['NP'] + W['gt_pi'].astype(np.int64)
         W['gt_fold'] = W['q_fold'][W['gt_qi']]
         W['fold_q'] = {f: np.flatnonzero(W['q_fold'] == f) for f in ('fit', 'tune', 'hold')}
@@ -176,7 +188,7 @@ def build_test_world(cfg, maps):
 
 # ============================================================ dense embeddings
 def encoder_key(cfg):
-    return 'enc_' + cfg_hash(dict(e=cfg['encoder'], w=world_key(cfg, 'train')))
+    return 'enc_' + cfg_hash(dict(e=cfg['encoder'], w=world_key(cfg, 'train'), ef=cfg['world'].get('enc_frac', 0)))
 
 
 def get_hash_encoder(cfg, Wtr):
@@ -188,7 +200,7 @@ def get_hash_encoder(cfg, Wtr):
     if os.path.exists(path):
         model.load_state_dict(torch.load(path, map_location='cpu'))
         return model.to('cuda' if torch.cuda.is_available() else 'cpu').eval()
-    fit = Wtr['q_fold'][Wtr['gt_qi']] == 'fit'
+    fit = Wtr['q_fold'][Wtr['gt_qi']] == enc_fold_name(cfg)
     with Timer('train hash encoder'):
         model = E.train_hash_encoder(Wtr['Qm'], Wtr['Pm'], Wtr['R'], Wtr['gt_qi'][fit], Wtr['gt_pi'][fit], ec, cfg['seed'])
     torch.save(model.state_dict(), path)
@@ -201,7 +213,8 @@ def get_embeddings(cfg, W, name, Wtr=None):
     if name == 'embG':
         key = encoder_key(cfg)
     else:
-        key = 'st_' + cfg_hash(dict(s=cfg['st'], w=world_key(cfg, 'train') if cfg['st']['finetune'] else ''))
+        key = 'st_' + cfg_hash(dict(s=cfg['st'], w=world_key(cfg, 'train') if cfg['st']['finetune'] else '',
+                                    **({'ef': cfg['world'].get('enc_frac', 0)} if cfg['st']['finetune'] else {})))
     pq, pp = os.path.join(W['dir'], f'{name}_{key}_Q.npy'), os.path.join(W['dir'], f'{name}_{key}_P.npy')
     if os.path.exists(pq) and os.path.exists(pp):
         return np.load(pq), np.load(pp)
@@ -226,10 +239,10 @@ def get_st_model(cfg, Wtr):
     model = E.load_st(sc['model'], sc['max_len'])
     if not sc['finetune']:
         return model
-    path = _cache(cfg, 'encoders', 'st_ft_' + cfg_hash(dict(s=sc, w=world_key(cfg, 'train'))))
+    path = _cache(cfg, 'encoders', 'st_ft_' + cfg_hash(dict(s=sc, w=world_key(cfg, 'train'), ef=cfg['world'].get('enc_frac', 0))))
     if os.path.exists(os.path.join(path, 'DONE')):
         return E.load_st(path, sc['max_len'])
-    fit = Wtr['q_fold'][Wtr['gt_qi']] == 'fit'
+    fit = Wtr['q_fold'][Wtr['gt_qi']] == enc_fold_name(cfg)
     qi, pi = Wtr['gt_qi'][fit], Wtr['gt_pi'][fit]
     rng = np.random.RandomState(cfg['seed'])
     order = rng.permutation(len(qi))

@@ -16,6 +16,8 @@ DEFAULTS = {
     'world': {
         'n_s1_sample': 300_000,       # train S1 entities in the experiment world (fit/tune/hold by entity hash)
         'fold_pcts': [60, 20, 20],
+        'enc_frac': 0.34,             # share of the fit fold moved to an 'enc' fold that ONLY trains learned encoders (no leakage
+                                      # of encoder memorisation into the pruner/matcher training rows); 0 = old behaviour
         'pool': 'full',               # 'full' = every S2/S3 record (realistic) | 'mini' = matches of sampled S1 + distractors
         'mini_distractors': 200_000,
         'map_pairs': 300_000,         # fit-fold positive pairs used to learn synonym maps

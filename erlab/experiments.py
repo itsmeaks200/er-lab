@@ -75,7 +75,7 @@ def base_parts(cfg):
     if cfg['st']['enabled'] and _torch_gpu():
         emb.append('embS')
     key = cfg_hash(dict(w=PL.world_key(cfg, 'train'), b=cfg['block'], r=cfg['retr'], passes=passes, emb=emb,
-                        e=cfg['encoder'], s=cfg['st'], f=cfg['feats'], pc=cfg['prune1']))
+                        e=cfg['encoder'], s=cfg['st'], f=cfg['feats'], pc=cfg['prune1'], ef=cfg['world'].get('enc_frac', 0)))
     return passes, emb, key
 
 
@@ -342,7 +342,8 @@ def run_prune(cfg, rep, args):
             first_row = False
         rows.append(dict(setting=lab, cut=str(ctx.stage1['cut']), cand_per_S1=st['avg_per_S1'], p50=st['p50_per_S1'],
                          p95=st['p95_per_S1'], max=st['max_per_S1'], pair_recall=st['recall'], oracle_hold=ctx.oracle['hold'],
-                         hold_F05=row['hold_F05'], tune_F05=row['tune_F05'], rule=row['best_rule']))
+                         hold_F05=row['hold_F05'], hold_P=row['hold_P'], hold_R=row['hold_R'], singleton_acc=row['singleton_acc'],
+                         avg_pred=row['avg_pred'], tune_F05=row['tune_F05'], rule=row['best_rule']))
         del ctx
         gc.collect()
     df = pd.DataFrame(rows).set_index('setting')
