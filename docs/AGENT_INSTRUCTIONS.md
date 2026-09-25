@@ -9,7 +9,7 @@ Rules:
    If code fails, do NOT rewrite it. Report the traceback, which is in `results/PASTE_BACK.md`.
 2. Never commit or push. Never delete `cache/` unless I ask. It holds hours of computation.
 3. Long commands: run them in a persistent terminal, e.g. `nohup python run.py wave 1 > wave1.log 2>&1 &` on Linux or
-   `Start-Process` / a separate terminal on Windows. Poll the log every few minutes (`tail -n 30 wave1.log`) until it prints `DONE.`
+   `Start-Process` / a separate terminal on Windows. Poll the log only every 15-20 minutes (`tail -n 30 wave1.log`), and do nothing in between, until it prints `DONE.`
 4. When a command finishes, print the full content of `results/PASTE_BACK.md` and nothing else. That is what I copy.
 5. If memory runs out (MemoryError / killed), rerun the same command with `--set world.n_s1_sample=150000` and say so.
 
