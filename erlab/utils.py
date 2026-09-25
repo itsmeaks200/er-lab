@@ -47,6 +47,28 @@ class Timer:
         log(f'<< {self.name}: {dt:.1f}s')
 
 
+class Progress:
+    """Throttled progress lines for long loops: at most one line per `every` seconds with done/total, rate and ETA."""
+    def __init__(self, tag, total, unit='items', every=60.0):
+        self.tag, self.total, self.unit, self.every = tag, max(int(total), 1), unit, every
+        self.t0 = self.last = time.time()
+        log(f'   {tag}: started ({total:,} {unit})')
+
+    def update(self, done, force=False):
+        now = time.time()
+        if not force and now - self.last < self.every:
+            return
+        self.last = now
+        el = now - self.t0
+        rate = done / max(el, 1e-9)
+        eta = (self.total - done) / max(rate, 1e-9)
+        log(f'   {self.tag}: {done:,}/{self.total:,} {self.unit} ({100 * done / self.total:5.1f}%) | {rate:,.0f}/s | '
+            f'elapsed {el / 60:.1f} min | ETA {eta / 60:.1f} min')
+
+    def done(self):
+        log(f'   {self.tag}: done {self.total:,} {self.unit} in {(time.time() - self.t0) / 60:.1f} min')
+
+
 def cfg_hash(obj, n=10):
     return hashlib.md5(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:n]
 

@@ -12,7 +12,7 @@ import scipy.sparse as sp
 from sklearn.preprocessing import normalize as sk_normalize
 
 from . import text as T
-from .utils import umap, log
+from .utils import umap, log, Progress
 
 KEY_PASSES = ['A', 'B', 'E', 'H']
 SPARSE_PASSES = ['C', 'D', 'F', 'I']
@@ -124,7 +124,9 @@ def sparse_passes(Qm, Pm, q_rows, q_ck, p_slices, R, k, which, cfg):
     need = {'name': any(p in which for p in 'CF'), 'addr': any(p in which for p in 'DF'), 'char': 'I' in which}
     for c, rows_c, ps, pe in country_groups(np.asarray(q_rows), q_ck, p_slices, Pm['ntok'].shape[0]):
         t = time.time()
+        log(f'   sparse {which} [{c}]: preparing pool matrices ({pe - ps:,} pool records)')
         PT = {f: retr_mat(Pm, slice(ps, pe), RETR_FIELDS[f], R['W'], 'p', bm25).T.tocsr() for f in need if need[f]}
+        pg = Progress(f'sparse {which} [{c}]', len(rows_c), 'queries')
         for s in range(0, len(rows_c), chunk):
             qi = rows_c[s:s + chunk]
             SC = {f: (retr_mat(Qm, qi, RETR_FIELDS[f], R['W'], 'q', bm25) @ PT[f]).tocsr() for f in PT}
@@ -137,6 +139,7 @@ def sparse_passes(Qm, Pm, q_rows, q_ck, p_slices, R, k, which, cfg):
                 r, cix, sc, rk = topk_csr(S, k)
                 out[p].append(pd.DataFrame({'qi': qi[r].astype(np.int32), 'pi': (cix.astype(np.int64) + ps).astype(np.int32),
                                             'score': sc, 'rank': rk}))
+            pg.update(min(s + chunk, len(rows_c)))
         log(f'   sparse {which} [{c}] {len(rows_c):,} q x {pe - ps:,} pool: {time.time() - t:.0f}s')
         del PT
         gc.collect()
@@ -198,6 +201,7 @@ def dense_pass(Qe, Pe, q_rows, q_ck, p_slices, k, chunk=512):
     R_, C_, S_, K_ = [], [], [], []
     for c, rows_c, ps, pe in country_groups(np.asarray(q_rows), q_ck, p_slices, len(Pe)):
         t = time.time()
+        pg = Progress(f'dense [{c}]', len(rows_c), 'queries')
         Pt = torch.from_numpy(Pe[ps:pe]).to(dev)
         if dev == 'cpu':
             Pt = Pt.float()
@@ -211,6 +215,7 @@ def dense_pass(Qe, Pe, q_rows, q_ck, p_slices, k, chunk=512):
                 v, ix = torch.topk(q @ Pt.T, kk, dim=1)
                 R_.append(np.repeat(qi, kk).astype(np.int32)); C_.append((ix.cpu().numpy().ravel() + ps).astype(np.int32))
                 S_.append(v.float().cpu().numpy().ravel()); K_.append(np.tile(np.arange(kk, dtype=np.int16), len(qi)))
+                pg.update(min(s + chunk, len(rows_c)))
         del Pt
         if dev == 'cuda':
             torch.cuda.empty_cache()

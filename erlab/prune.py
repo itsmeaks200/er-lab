@@ -14,7 +14,7 @@ from . import features as FT
 from . import evaluate as EV
 from .blocking import PASS_BITS, KEY_PASSES
 from .models import Model
-from .utils import log, Timer
+from .utils import log, Timer, Progress
 
 REC = ['a_missing', 'n_ntok', 'a_ntok', 'nf_s1', 'nf_pool', 'f_nonascii', 'f_domain', 'f_junk']
 CTX = ['n_tok_cos', 'a_tok_cos', 'n_char_cos', 'comb', 'embG_cos', 'embS_cos']
@@ -62,6 +62,7 @@ def cheap_features(cand, W, emb, passes, alpha=0.6, pool_ctx=False, chunk=4_000_
     qi, pi = cand.qi.to_numpy(), cand.pi.to_numpy()
     n = len(cand)
     X, cols, local = None, None, None
+    pg = Progress('stage-1 cheap features', n, 'pairs')
     for s in range(0, max(n, 1), chunk):
         f = _chunk_feats(qi[s:s + chunk], pi[s:s + chunk], W, emb)
         if X is None:
@@ -77,6 +78,8 @@ def cheap_features(cand, W, emb, passes, alpha=0.6, pool_ctx=False, chunk=4_000_
         for j, c in enumerate(local):
             X[s:s + chunk, j] = f[c]
         del f
+        pg.update(min(s + chunk, n))
+    log('   stage-1 cheap features: record attributes, pass scores, within-S1 / within-pool ranks')
     ix = {c: j for j, c in enumerate(cols)}
     X[:, ix['comb']] = alpha * np.nan_to_num(X[:, ix['n_tok_cos']]) + (1 - alpha) * np.nan_to_num(X[:, ix['a_tok_cos']])
     bits = cand.bits.to_numpy()
@@ -132,6 +135,7 @@ def fit_pruner(X, y, qi, rows, q_hash, pc, seed=42):
     rounds = max(50, int(full.best_iter * 1.05))
     h = q_hash[qi]
     for k in range(2):
+        log(f'   stage-1 pruner: out-of-fold model {k + 1}/2 ({rounds} rounds)')
         trk, prk = tr[h[tr] != k], fit[h[fit] == k]
         mk = Model('lgb', params, rounds, 10 ** 9, seed).fit_fixed(X[trk], y[trk])
         p[prk] = predict_rows(mk, X, prk)

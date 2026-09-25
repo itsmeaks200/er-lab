@@ -116,9 +116,17 @@ def load_st(name, max_len):
     return m
 
 
-def embed_st(model, texts, batch):
-    e = model.encode(texts, batch_size=batch, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-    return e.astype(np.float16)
+def embed_st(model, texts, batch, slice_size=200_000):
+    from .utils import Progress
+    out = np.empty((len(texts), model.get_sentence_embedding_dimension()), np.float16)
+    pg = Progress('sentence-transformer embeddings', len(texts), 'texts')
+    for s in range(0, len(texts), slice_size):
+        e = model.encode(texts[s:s + slice_size], batch_size=batch, convert_to_numpy=True, normalize_embeddings=True,
+                         show_progress_bar=False)
+        out[s:s + len(e)] = e.astype(np.float16)
+        pg.update(s + len(e))
+    pg.done()
+    return out
 
 
 def finetune_st(model, q_texts, p_texts, sc, seed=42):
