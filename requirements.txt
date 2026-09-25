@@ -1,0 +1,19 @@
+# core (CPU)
+numpy>=1.24
+pandas>=2.0
+pyarrow>=12
+scipy>=1.10
+scikit-learn>=1.2
+lightgbm>=4.0
+xgboost>=2.0
+catboost>=1.2
+rapidfuzz>=3.6
+numba>=0.58
+psutil
+tabulate
+optuna>=3.0
+# GPU / neural (install torch matching your CUDA first: https://pytorch.org/get-started/locally/)
+torch>=2.1
+transformers>=4.40
+sentence-transformers>=3.0
+hf_xet

@@ -1,0 +1,12 @@
+cache/
+mini_data/
+dataset/
+results/runs/
+results/submission/
+results/*.csv
+results/*.json
+results/PASTE_BACK.md
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+catboost_info/
