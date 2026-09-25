@@ -419,8 +419,9 @@ def _oof_p1(ctx, mcfg, feats, n_folds=2):
     full = Model(mcfg['kind'], mcfg['params'], mcfg['rounds'], mcfg['early_stop'], ctx.cfg['seed'], feats)
     tr = cap_rows(ctx, fit, mcfg['max_train_rows'])
     full.fit(X_of(ctx, tr, feats), ctx.y[tr], ctx.qi[tr], X_of(ctx, ctx.rows['tune'], feats), ctx.y[ctx.rows['tune']], ctx.qi[ctx.rows['tune']])
-    for f in ('tune', 'hold'):
-        p1[ctx.rows[f]] = full.predict(X_of(ctx, ctx.rows[f], feats))
+    for rows in (ctx.rows['tune'], ctx.rows['hold'], np.flatnonzero(ctx.fold == 'enc')):   # enc: unseen by `full`
+        if len(rows):
+            p1[rows] = full.predict(X_of(ctx, rows, feats))
     rounds = max(100, int(getattr(full, 'best_iter', 500) * 1.05))
     for k in range(n_folds):
         trk, prk = tr[h[tr] != k], fit[h[fit] == k]
@@ -455,6 +456,7 @@ def run_stage2(cfg, rep, args):
     res2 = evaluate_scores(ctx, pt, ph)
     row2 = score_row(f'{rep.exp_id}-stage2', res2)
     rep.leaderboard(row2)
+    os.makedirs(os.path.dirname(_pred_path(ctx, 'x')), exist_ok=True)
     np.savez(_pred_path(ctx, f'{rep.exp_id}-stage2'), pt=pt, ph=ph)
     rep.table('stage 1 vs stage 2 (hold)', pd.DataFrame([row1, row2]).set_index('model'), short=True)
     rep.table('stage-2 gain importance', pd.Series(m2.importance(), index=cols).sort_values(ascending=False).head(15).to_frame('gain'), short=True)
@@ -465,20 +467,24 @@ def _crossenc_feature(ctx, p1, rep):
     from . import crossenc as CE
     cc = ctx.cfg['crossenc']
     W = ctx.W
-    fit = ctx.rows['fit']
+    enc = np.flatnonzero(ctx.fold == 'enc')
+    src = enc if len(enc) else ctx.rows['fit']      # train on the encoder fold -> no in-sample CE scores on fit rows
     rng = np.random.RandomState(ctx.cfg['seed'])
-    pos = fit[ctx.y[fit] == 1]
-    neg = fit[ctx.y[fit] == 0]
+    pos = src[ctx.y[src] == 1]
+    neg = src[ctx.y[src] == 0]
     rk = pd.Series(p1[neg]).groupby(ctx.qi[neg]).rank(ascending=False, method='first').to_numpy()
     hard = neg[rk <= 4]
     nneg = min(len(hard), cc['neg_per_pos'] * len(pos))
     tr = np.r_[pos, rng.choice(hard, nneg, replace=False)]
     if len(tr) > cc['max_train_pairs']:
         tr = rng.choice(tr, cc['max_train_pairs'], replace=False)
+    rep.text(f"cross-encoder {cc['model']}: {len(tr):,} training pairs from the "
+             f"{'enc' if len(enc) else 'fit'} fold; scoring {int((ctx.fold != 'enc').sum()):,} candidate rows in scope", short=True)
     with Timer(f'cross-encoder train on {len(tr):,} pairs'):
         model, tok = CE.train_crossenc(cc, CE.serialise(W['Q'], ctx.qi[tr]), CE.serialise(W['P'], ctx.pi[tr]), ctx.y[tr], ctx.cfg['seed'])
     ce = np.full(len(p1), np.nan, np.float32)
-    sel = CE.select_rows(ctx.qi, p1, cc['band'], cc['top_n'])
+    sel = CE.select_rows(ctx.qi, p1, cc['band'], cc['top_n'], cc.get('max_pred_pairs', 0))
+    sel = sel[ctx.fold[sel] != 'enc']
     with Timer(f'cross-encoder predict {len(sel):,} pairs'):
         ce[sel] = CE.predict_crossenc(model, tok, CE.serialise(W['Q'], ctx.qi[sel]), CE.serialise(W['P'], ctx.pi[sel]), cc)
     from sklearn.metrics import roc_auc_score

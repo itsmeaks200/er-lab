@@ -60,6 +60,11 @@ EXPERIMENTS = {
                 cfg={'crossenc': {'enabled': True}}, args=dict(crossenc=True)),
     'N03': dict(wave=3, kind='stage2', desc='stage 2 + cross-encoder on ALL stage-1 survivors (affordable: ~5 cands/S1)',
                 cfg={'crossenc': {'enabled': True, 'band': [0.0, 1.0], 'top_n': 50}}, args=dict(crossenc=True)),
+    'N04': dict(wave=3, kind='stage2', desc='stage 2 + LARGE cross-encoder multilingual-e5-large (560M, MIT) on the uncertain band',
+                cfg={'crossenc': {'enabled': True, 'model': 'intfloat/multilingual-e5-large', 'max_len': 64, 'batch': 32,
+                                  'lr': 1.5e-5, 'max_train_pairs': 400_000, 'train_minutes': 75, 'pred_batch': 256,
+                                  'band': [0.02, 0.98], 'top_n': 8, 'max_pred_pairs': 1_500_000}},
+                args=dict(crossenc=True)),
     # ------------------------------------------------------------------ wave 4: submission
     'S01': dict(wave=4, kind='submit', desc='final: LightGBM baseline + best rule → test submission',
                 args=dict(models=[dict(kind='lgb', params={})])),
@@ -80,6 +85,7 @@ OVERNIGHT = dict(
          'M05', 'M06', 'M04',      # XGBoost, CatBoost, lambdarank
          'M11', 'M12', 'N03',      # stage-2 cross-source reranker, Optuna HPO, cross-encoder on all survivors
          'M02', 'M03', 'M07', 'M08',
-         'M09', 'M10', 'D01'],     # blend of all members, feature-group ablation, decision-rule deep dive
+         'M09', 'M10', 'D01',      # blend of all members, feature-group ablation, decision-rule deep dive
+         'N04'],                   # LARGE cross-encoder (multilingual-e5-large, 560M, MIT) last: slowest, capped ~2.5 h
     sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True'],
 )

@@ -44,7 +44,7 @@ P01 uses a 300k-S1 world; P02 uses ALL ~2.2M train S1 (needed for its per-pool-r
 memory-hungry one. Do NOT shrink `world.n_s1_sample` for P02 if it runs out of memory; report the error instead.
 Afterwards print `results/PASTE_BACK.md`.
 
-## Overnight run (everything, full data, ~8-10 h)
+## Overnight run (everything, full data, ~10-12 h; the large cross-encoder N04 runs last)
 ```powershell
 Start-Process python -ArgumentList 'run.py','overnight' -RedirectStandardOutput overnight.log -RedirectStandardError overnight.err -WindowStyle Hidden
 ```
