@@ -36,7 +36,15 @@ python run.py wave 0 1 2 3 --smoke --data ./mini_data --results ./results_smoke 
 ```
 Report `results/PASTE_BACK.md` (ENV) and `results_smoke/PASTE_BACK.md` (smoke). The smoke scores are meaningless; only OK/FAILED matters.
 
-## Step 2+: the real waves (only when I say which one)
+## Step 2: stage-1 learned blocking on the FULL data (run this first)
+```bash
+python run.py exp P01 P02 --keep-going > p.log 2>&1        # Windows: Start-Process / separate terminal, same command
+```
+P01 uses a 300k-S1 world; P02 uses ALL ~2.2M train S1 (needed for its per-pool-record features), so it is the slow and
+memory-hungry one. Do NOT shrink `world.n_s1_sample` for P02 if it runs out of memory; report the error instead.
+Afterwards print `results/PASTE_BACK.md`.
+
+## Step 3+: the real waves (only when I say which one)
 ```bash
 python run.py wave 1 --keep-going          # blocking      (first run builds caches: ~1-2 h)
 python run.py wave 2 --keep-going          # models         (~2-4 h)

@@ -2,7 +2,7 @@
 
 Waves (run in order; each wave's PASTE_BACK.md is sent back to the chat):
   0  ENV, SMOKE                         — environment + end-to-end on a mini dataset (minutes)
-  1  B01..B05                           — blocking architecture on the FULL train pool
+  1  B01..B05, P01, P02                 — blocking architecture on the FULL train pool; P = stage-1 learned pruning
   2  M01..M08, M09, M10, D01            — model families, blend, ablations, decision rules
   3  M11, M12, N01, N02                 — stage-2 cross-source reranker, HPO, sentence-transformers, cross-encoder
   4  S01 / S02                          — final training + test inference + validated submission files
@@ -31,6 +31,11 @@ EXPERIMENTS = {
                 cfg={'st': {'enabled': True}}),
     'B05': dict(wave=1, kind='blocking', desc='+ contrastively fine-tuned e5-small dense pass S (SC-Block style)',
                 cfg={'st': {'enabled': True, 'finetune': True}}),
+    # stage-1 learned blocking: shrink the candidate set per S1 (the final ranking rewards fewer candidates)
+    'P01': dict(wave=1, kind='prune', desc='stage-1 learned blocking (cheap signals) on B04 retrieval: matcher F0.5 vs candidates/S1',
+                cfg={'st': {'enabled': True}, 'prune1': {'enabled': True}}, args=dict(baseline=True)),
+    'P02': dict(wave=1, kind='prune', desc='P01 on ALL train S1 + within-pool-record ranks + top-m S1 per pool record (unique assignment)',
+                cfg={'world': {'n_s1_sample': 10 ** 9}, 'st': {'enabled': True}, 'prune1': {'enabled': True, 'pool_ctx': True}}),
     # ------------------------------------------------------------------ wave 2: models on B01 blocking
     'M01': dict(wave=2, kind='model', desc='LightGBM baseline (127 leaves)', args=dict(show_imp=True)),
     'M02': dict(wave=2, kind='model', desc='LightGBM shallow/regularised (synthetic-noise law: 31 leaves, ff 0.5)',
@@ -55,6 +60,9 @@ EXPERIMENTS = {
                 cfg={'crossenc': {'enabled': True}}, args=dict(crossenc=True)),
     # ------------------------------------------------------------------ wave 4: submission
     'S01': dict(wave=4, kind='submit', desc='final: LightGBM baseline + best rule → test submission',
+                args=dict(models=[dict(kind='lgb', params={})])),
+    'S03': dict(wave=4, kind='submit', desc='final: stage-1 learned blocking (small candidate_pairs.tsv) + LightGBM matcher → test submission',
+                cfg={'st': {'enabled': True}, 'prune1': {'enabled': True, 'pool_ctx': True}, 'world': {'n_s1_sample': 10 ** 9}},
                 args=dict(models=[dict(kind='lgb', params={})])),
     'S02': dict(wave=4, kind='submit', desc='final: stage-2 cross-source reranker → test submission',
                 args=dict(models=[dict(kind='lgb', params={})], stage2=True)),

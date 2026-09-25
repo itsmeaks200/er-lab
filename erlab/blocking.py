@@ -221,16 +221,29 @@ def dense_pass(Qe, Pe, q_rows, q_ck, p_slices, k, chunk=512):
                          'rank': np.concatenate(K_)})
 
 
-def union_candidates(pass_dfs, K_sel, n_pool):
-    keys, bits = [], []
+def union_candidates(pass_dfs, K_sel, n_pool, scores=True):
+    """Union of the selected passes with a pass bitmask; for ranked passes also the retrieval score s_X and rank r_X
+    (1-based, NaN when the pass did not retrieve the pair)."""
+    keys, bits, kept = [], [], {}
     for p, K in K_sel.items():
         d = pass_dfs[p]
         if p not in KEY_PASSES and K is not None:
             d = d[d['rank'] < K]
+        kept[p] = d
         keys.append(d.qi.to_numpy(np.int64) * n_pool + d.pi.to_numpy(np.int64))
         bits.append(np.full(len(d), PASS_BITS[p], np.uint16))
     keys, bits = np.concatenate(keys), np.concatenate(bits)
     uk, inv = np.unique(keys, return_inverse=True)
     ob = np.zeros(len(uk), np.uint16)
     np.bitwise_or.at(ob, inv.ravel(), bits)
-    return pd.DataFrame({'qi': (uk // n_pool).astype(np.int32), 'pi': (uk % n_pool).astype(np.int32), 'bits': ob})
+    out = pd.DataFrame({'qi': (uk // n_pool).astype(np.int32), 'pi': (uk % n_pool).astype(np.int32), 'bits': ob})
+    if scores:
+        for p, d in kept.items():
+            if p in KEY_PASSES:
+                continue
+            k = d.qi.to_numpy(np.int64) * n_pool + d.pi.to_numpy(np.int64)
+            pos = np.searchsorted(uk, k)
+            sc = np.full(len(uk), np.nan, np.float32); rk = np.full(len(uk), np.nan, np.float32)
+            sc[pos] = d.score.to_numpy(np.float32); rk[pos] = d['rank'].to_numpy(np.float32) + 1
+            out['s_' + p], out['r_' + p] = sc, rk
+    return out

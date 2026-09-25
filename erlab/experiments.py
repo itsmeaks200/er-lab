@@ -12,6 +12,7 @@ from . import pipeline as PL
 from . import features as FT
 from . import evaluate as EV
 from . import blocking as B
+from . import prune as PR
 from .models import Model, blend_weights, rank01
 from .report import Report
 from .utils import Timer, log, cfg_hash, save_json, load_json, TIMINGS
@@ -58,7 +59,8 @@ def _torch_gpu():
         return False
 
 
-def build_ctx(cfg, rep=None):
+def base_parts(cfg):
+    """Train world + blocking passes + selected plan (shared by build_ctx and the stage-1 runner)."""
     passes = list(cfg['block']['passes'])
     if 'S' not in passes and cfg['st']['enabled']:
         passes.append('S')
@@ -73,33 +75,84 @@ def build_ctx(cfg, rep=None):
     if cfg['st']['enabled'] and _torch_gpu():
         emb.append('embS')
     key = cfg_hash(dict(w=PL.world_key(cfg, 'train'), b=cfg['block'], r=cfg['retr'], passes=passes, emb=emb,
-                        e=cfg['encoder'], s=cfg['st'], f=cfg['feats']))
+                        e=cfg['encoder'], s=cfg['st'], f=cfg['feats'], pc=cfg['prune1']))
+    return passes, emb, key
+
+
+def build_ctx(cfg, rep=None):
+    passes, emb, key = base_parts(cfg)
     if key in _CTX:
         return _CTX[key]
     W = PL.build_train_world(cfg)
     pdfs = PL.run_passes(cfg, W, passes)
     blk = PL.select_blocking(cfg, W, pdfs)
     plan = dict(passes=blk['passes'], K=blk['K'], emb=emb)
-    cand, F = PL.get_features(cfg, W, pdfs, plan)
-    y = PL.label_candidates(W, cand)
-    sz = FT.safe_zone(F)
-    loss = float(y[sz].sum() / max(len(W['gt_keys']), 1))
-    prune = bool(cfg['feats']['prune'] and loss <= cfg['feats']['prune_max_loss'])
-    if prune:
-        cand, F, y = PL.apply_prune(cand, F, y, plan)
-    plan['prune'] = prune
+    if cfg['prune1']['enabled']:
+        S1 = PL.run_stage1(cfg, W, pdfs, plan)
+        info = stage1_info(cfg, W, S1)
+        prm = PR.choose_cut(info['frontier'], info['oracle0']['tune'], cfg['prune1']['max_oracle_loss'])
+        ctx = next(stage1_ctxs(cfg, W, pdfs, blk, plan, S1, info, [prm], key))
+    else:
+        cand, F = PL.get_features(cfg, W, pdfs, plan)
+        y = PL.label_candidates(W, cand)
+        sz = FT.safe_zone(F)
+        loss = float(y[sz].sum() / max(len(W['gt_keys']), 1))
+        prune = bool(cfg['feats']['prune'] and loss <= cfg['feats']['prune_max_loss'])
+        if prune:
+            cand, F, y = PL.apply_prune(cand, F, y, plan)
+        plan['prune'] = prune
+        ctx = make_ctx(cfg, W, pdfs, blk, plan, cand, F, y, key,
+                       dict(pruned_share=float(sz.mean()), recall_loss=loss, applied=prune))
+    _CTX.clear()
+    _CTX[key] = ctx
+    return ctx
+
+
+def make_ctx(cfg, W, pdfs, blk, plan, cand, F, y, key, prune_info, stage1=None):
     qi, pi = cand.qi.to_numpy(), cand.pi.to_numpy()
     fold = W['q_fold'][qi]
     ctx = SimpleNamespace(cfg=cfg, W=W, pdfs=pdfs, blk=blk, plan=plan, cand=cand, F=F, y=y, qi=qi, pi=pi,
                           s3=(W['P'].src.to_numpy()[pi] == 3), fold=fold, key=key,
                           rows={f: np.flatnonzero(fold == f) for f in ('fit', 'tune', 'hold')},
-                          prune_info=dict(pruned_share=float(sz.mean()), recall_loss=loss, applied=prune))
+                          prune_info=prune_info, stage1=stage1)
     ctx.colidx = {c: i for i, c in enumerate(F.columns)}
     ctx.oracle = {f: EV.s1_metrics(qi[ctx.rows[f]][y[ctx.rows[f]] == 1], np.ones(int(y[ctx.rows[f]].sum())),
                                    W['n_true'], W['fold_q'][f])['F05'] for f in ctx.rows}
-    _CTX.clear()
-    _CTX[key] = ctx
     return ctx
+
+
+def stage1_info(cfg, W, S1):
+    """Stage-0 oracle per fold + the tune-fold frontier of pruner cuts."""
+    qi0, y0 = S1['cand'].qi.to_numpy(), S1['y']
+    fold0 = W['q_fold'][qi0]
+    rows0 = {f: np.flatnonzero(fold0 == f) for f in ('fit', 'tune', 'hold')}
+    oracle0 = {f: EV.s1_metrics(qi0[r][y0[r] == 1], np.ones(int(y0[r].sum())), W['n_true'], W['fold_q'][f])['F05']
+               for f, r in rows0.items()}
+    with Timer('stage-1 cut frontier (tune)'):
+        fr = PR.frontier(S1['p'], y0, qi0, S1['qr'], S1['pr'], rows0['tune'], W['fold_q']['tune'], W['n_true'], cfg['prune1'])
+    keys0 = qi0.astype(np.int64) * W['NP'] + S1['cand'].pi.to_numpy(np.int64)
+    from sklearn.metrics import roc_auc_score
+    h = rows0['hold']
+    auc = float(roc_auc_score(y0[h], S1['p'][h])) if 0 < y0[h].mean() < 1 else float('nan')
+    return dict(oracle0=oracle0, frontier=fr, stats0=PL.cand_stats(W, 'stage 0 union', keys0), rows0=rows0, auc=auc)
+
+
+def stage1_ctxs(cfg, W, pdfs, blk, plan, S1, info, prms, key):
+    """One ctx per cut. Matcher features are computed once on the union of all survivors, then subset per cut."""
+    masks = [PR.cut_mask(S1['p'], S1['qr'], S1['pr'], prm) for prm in prms]
+    U = np.logical_or.reduce(masks)
+    cand_u, F_u = PL.stage1_features(cfg, W, plan, S1, U, str(prms))
+    plan = dict(plan, prune=False, stage1=True)
+    for prm, mk in zip(prms, masks):
+        if len(prms) == 1:
+            cand, F = cand_u, F_u
+        else:
+            cand, F = PL.subset_context(cand_u, F_u, np.flatnonzero(mk[U]), plan['passes'])
+        y = PL.label_candidates(W, cand)
+        keys = cand.qi.to_numpy(np.int64) * W['NP'] + cand.pi.to_numpy(np.int64)
+        st = dict(cut=prm, info=info, model=S1['model'], cols=S1['cols'], imp=S1['imp'],
+                  stats=PL.cand_stats(W, f"stage 1 cut {prm}", keys))
+        yield make_ctx(cfg, W, pdfs, blk, plan, cand, F, y, key + '_' + cfg_hash(prm), dict(stage1_cut=prm), st)
 
 
 def X_of(ctx, rows, feats):
@@ -227,7 +280,10 @@ def run_blocking(cfg, rep, args):
     rep.table('greedy union (fit-fold recall)', blk['greedy'], short=True)
     final = PL.cand_stats(ctx.W, 'UNION ' + '+'.join(ctx.plan['passes']),
                           ctx.cand.qi.to_numpy(np.int64) * ctx.W['NP'] + ctx.cand.pi.to_numpy(np.int64))
-    rep.table('final union after pruning', pd.DataFrame([final]).set_index('strategy'), short=True)
+    if ctx.stage1:
+        report_stage1(rep, ctx.stage1)
+    else:
+        rep.table('final union after pruning', pd.DataFrame([final]).set_index('strategy'), short=True)
     rep.text(f"K selected: {ctx.plan['K']} | prune: {ctx.prune_info} | oracle F0.5 per fold: "
              f"{ {k: round(v, 4) for k, v in ctx.oracle.items()} }", short=True)
     missed = ctx.W['gt_keys'][~np.isin(ctx.W['gt_keys'], ctx.cand.qi.to_numpy(np.int64) * ctx.W['NP'] + ctx.cand.pi.to_numpy(np.int64))]
@@ -238,6 +294,60 @@ def run_blocking(cfg, rep, args):
                        pool_name=ctx.W['P'].business_name.iloc[p], pool_addr=ctx.W['P'].business_address.iloc[p][:60]))
     rep.table('examples of true pairs lost by blocking', pd.DataFrame(ex), short=True, short_rows=8)
     rep.metric(recall=final['recall'], avg_per_S1=final['avg_per_S1'], oracle_hold=ctx.oracle['hold'], passes=ctx.plan['passes'])
+
+
+def report_stage1(rep, st, frontier_rows=20, show_cands=True):
+    info = st['info']
+    if show_cands:
+        rep.table('candidates per S1: stage 0 (retrieval union) → stage 1 (learned pruner) = what the matcher scores',
+                  pd.DataFrame([info['stats0'], st['stats']]).set_index('strategy'), short=True)
+    rep.table('stage-1 cut frontier on tune (Pareto: candidates/S1 vs oracle F0.5)', PR.pareto(info['frontier']),
+              short=True, max_rows=60, short_rows=frontier_rows)
+    imp = pd.Series(st['imp']).sort_values(ascending=False)
+    rep.table('stage-1 pruner gain importance (top 15)', (imp / max(imp.sum(), 1e-9)).head(15).to_frame('share'), short=True)
+    rep.text(f"stage-0 oracle F0.5 { {k: round(v, 4) for k, v in info['oracle0'].items()} } | pruner hold AUC {info['auc']:.5f} | "
+             f"{len(st['cols'])} cheap features" + (f" | chosen cut {st['cut']}" if show_cands else ''), short=True)
+
+
+def run_prune(cfg, rep, args):
+    """Stage-1 learned blocking: frontier of cuts, then the matcher trained/evaluated on the survivors of several
+    oracle-loss budgets → hold F0.5 as a function of the candidate-set size."""
+    passes, emb, key = base_parts(cfg)
+    W = PL.build_train_world(cfg)
+    pdfs = PL.run_passes(cfg, W, passes)
+    blk = PL.select_blocking(cfg, W, pdfs)
+    rep.table('greedy union (fit-fold recall)', blk['greedy'], short=True)
+    plan = dict(passes=blk['passes'], K=blk['K'], emb=emb)
+    S1 = PL.run_stage1(cfg, W, pdfs, plan)
+    info = stage1_info(cfg, W, S1)
+    labels, prms = [], []
+    if args.get('baseline'):
+        labels.append('all stage-0 pairs'); prms.append(dict(t=-1.0, n_max=0, m_pool=0))
+    for b in args.get('budgets', [0.0005, 0.001, 0.002, 0.004, 0.008]):
+        prm = PR.choose_cut(info['frontier'], info['oracle0']['tune'], b)
+        if prm not in prms:
+            labels.append(f'budget {b}'); prms.append(prm)
+    rows, first, first_row = [], True, True
+    for lab, ctx in zip(labels, stage1_ctxs(cfg, W, pdfs, blk, plan, S1, info, prms, key)):
+        if first:
+            report_stage1(rep, ctx.stage1, show_cands=False)
+            first = False
+        feats = feature_list(ctx.F, cfg['model']['feature_drop'])
+        _, res, row = train_eval(ctx, cfg['model'], feats, f'{rep.exp_id}-{lab}', rep)
+        st = ctx.stage1['stats']
+        if first_row:
+            rows.append(dict(setting='stage 0 retrieval union', cut='-', cand_per_S1=info['stats0']['avg_per_S1'],
+                             p50=info['stats0']['p50_per_S1'], p95=info['stats0']['p95_per_S1'], max=info['stats0']['max_per_S1'],
+                             pair_recall=info['stats0']['recall'], oracle_hold=info['oracle0']['hold']))
+            first_row = False
+        rows.append(dict(setting=lab, cut=str(ctx.stage1['cut']), cand_per_S1=st['avg_per_S1'], p50=st['p50_per_S1'],
+                         p95=st['p95_per_S1'], max=st['max_per_S1'], pair_recall=st['recall'], oracle_hold=ctx.oracle['hold'],
+                         hold_F05=row['hold_F05'], tune_F05=row['tune_F05'], rule=row['best_rule']))
+        del ctx
+        gc.collect()
+    df = pd.DataFrame(rows).set_index('setting')
+    rep.table('matcher (LightGBM) F0.5 vs candidate-set size', df, short=True)
+    rep.metric(**{f"F05@{r['cand_per_S1']:.2f}cand": r['hold_F05'] for r in rows if 'hold_F05' in r})
 
 
 def run_model(cfg, rep, args):
@@ -439,7 +549,7 @@ def run_decision(cfg, rep, args):
     rep.metric(best_rule=b, hold_F05=res[b]['hold']['F05'])
 
 
-RUNNERS = {'env': run_env, 'blocking': run_blocking, 'model': run_model, 'ablation': run_ablation, 'blend': run_blend,
+RUNNERS = {'env': run_env, 'blocking': run_blocking, 'prune': run_prune, 'model': run_model, 'ablation': run_ablation, 'blend': run_blend,
            'stage2': run_stage2, 'hpo': run_hpo, 'decision': run_decision}
 
 

@@ -16,6 +16,11 @@ import sys
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):      # Windows consoles default to cp1252; never crash on '→' etc.
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['list', 'exp', 'wave', 'make-mini'])
     ap.add_argument('ids', nargs='*')

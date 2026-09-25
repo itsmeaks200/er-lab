@@ -135,7 +135,7 @@ def pair_features(qi, pi, W, emb=None, alpha=0.6):
 
 
 GROUP_BASE = ['n_tset', 'n_char_cos', 'n_tok_wjacc', 'a_tset', 'a_tok_cos', 'comb_cos', 'name_x_addr',
-              'embG_cos', 'embS_cos']
+              'embG_cos', 'embS_cos', 'pr_p']
 CTX_PREFIX = ('blk_',)
 CTX_SUFFIX = ('_gap', '_rank', '_z')
 
@@ -179,14 +179,18 @@ def group_chunks(qi_sorted, chunk):
     return bounds
 
 
-def compute_features(cand, W, passes, emb=None, prune=False, chunk=1_000_000, scorer=None, keep_cols=None, alpha=0.6):
-    """scorer=None → (features, keep mask); else streams: (scores, keep mask, kept columns frame)."""
+def compute_features(cand, W, passes, emb=None, prune=False, chunk=1_000_000, scorer=None, keep_cols=None, alpha=0.6,
+                     extra=None):
+    """scorer=None → (features, keep mask); else streams: (scores, keep mask, kept columns frame).
+    extra: {column: array aligned with cand} appended as features (e.g. the stage-1 pruner score pr_p)."""
     qi_all, pi_all, bits_all = cand.qi.to_numpy(), cand.pi.to_numpy(), cand.bits.to_numpy()
     keep = np.ones(len(cand), bool)
     outs, kept = [], []
     bounds = group_chunks(qi_all, chunk)
     for j, (s, e) in enumerate(bounds):
         F = pair_features(qi_all[s:e], pi_all[s:e], W, emb, alpha)
+        for c, v in (extra or {}).items():
+            F[c] = np.asarray(v[s:e], np.float32)
         if prune:
             k = ~safe_zone(F)
             keep[s:e] = k

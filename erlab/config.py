@@ -45,7 +45,16 @@ DEFAULTS = {
         'enabled': False, 'model': 'intfloat/multilingual-e5-small', 'max_len': 64, 'batch': 1024,
         'finetune': False, 'ft_epochs': 1, 'ft_batch': 256, 'ft_lr': 3e-5, 'prefix': 'query: ',
     },
-    'feats': {'chunk': 1_000_000, 'prune': True, 'prune_max_loss': 0.001, 'version': 3},
+    'prune1': {                       # stage-1 learned blocking on cheap signals (see erlab/prune.py)
+        'enabled': False,
+        'pool_ctx': False,            # within-pool-record ranks + top-m S1 per pool record (needs the full S1 set in the world)
+        'max_oracle_loss': 0.002,     # tune-fold oracle-F0.5 we may give up for fewer candidates
+        't_grid': [0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1],
+        'n_grid': [0, 6, 8, 10, 12, 15],   # top-n per S1 (0 = no cap)
+        'm_grid': [0, 1, 2, 3],            # top-m S1 per pool record (0 = no cap; only with pool_ctx)
+        'rounds': 2000, 'early_stop': 50, 'max_train_rows': 30_000_000, 'params': {},
+    },
+    'feats': {'chunk': 1_000_000, 'prune': True, 'prune_max_loss': 0.001, 'version': 4},
     'model': {
         'kind': 'lgb',                # lgb | lgb_rank | xgb | cat | lr | mlp
         'params': {},                 # overrides of the per-kind defaults (models.py)

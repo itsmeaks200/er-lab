@@ -3,6 +3,8 @@ Stages and their cache keys:
   world (normalised frames + sparse matrices)   ← cfg.world, cfg.vec, maps
   pass_<X> (top-K candidates of one blocking pass) ← world key + cfg.retr/cfg.block (+ encoder/st keys)
   features (pair features of the candidate union)  ← passes + K + prune + feature version
+  st1_* (stage-1 pruner scores + model)           ← features key + cfg.prune1
+  feats1_* (matcher features of stage-1 survivors) ← st1 key + the cut
 Everything lives in cfg.paths.cache_dir; only small reports go to cfg.paths.results_dir."""
 import os
 import gc
@@ -17,6 +19,7 @@ from . import data as D
 from . import vec as V
 from . import blocking as B
 from . import features as FT
+from . import prune as PR
 from .utils import Timer, log, cfg_hash, save_json, load_json, STR
 
 WORLD_COLS = V.TEXT_COLS + V.REC_COLS + ['num0']
@@ -291,7 +294,7 @@ def cand_stats(W, name, keys):
     r = dict(strategy=name, pairs=len(keys), recall=hit.mean())
     for f in ('fit', 'tune', 'hold'):
         r['recall_' + f] = hit[W['gt_fold'] == f].mean()
-    r.update(avg_per_S1=per_q.mean(), p95_per_S1=np.percentile(per_q, 95), max_per_S1=int(per_q.max()),
+    r.update(avg_per_S1=per_q.mean(), p50_per_S1=float(np.median(per_q)), p95_per_S1=np.percentile(per_q, 95), max_per_S1=int(per_q.max()),
              S1_no_cand_pct=100 * (per_q == 0).mean(), reduction=1 - len(keys) / max(total, 1), missed=int((~hit).sum()))
     return r
 
@@ -379,3 +382,58 @@ def apply_prune(cand, F, y, plan):
     F = FT.drop_context(F)
     FT.add_context(F, cand.qi.to_numpy(), cand.bits.to_numpy(), plan['passes'])
     return cand, F, y
+
+
+# ============================================================ stage 1: learned blocking (erlab/prune.py)
+def stage1_key(cfg, W, plan):
+    pc = {k: v for k, v in cfg['prune1'].items() if k not in ('max_oracle_loss', 't_grid', 'n_grid', 'm_grid', 'enabled')}
+    return 'st1_' + cfg_hash(dict(f=feat_key(cfg, W, plan), pc=pc, seed=cfg['seed'], v=1))
+
+
+def run_stage1(cfg, W, pdfs, plan, Wtr=None):
+    """Train world: stage-0 union → cheap features → pruner (out-of-fold on fit) → per-S1 / per-pool ranks. Cached."""
+    pc = cfg['prune1']
+    base = os.path.join(W['dir'], stage1_key(cfg, W, plan))
+    cand = B.union_candidates(pdfs, plan['K'], W['NP'])
+    y = label_candidates(W, cand)
+    qi, pi = cand.qi.to_numpy(), cand.pi.to_numpy()
+    if os.path.exists(base + '.DONE'):
+        p, m = np.load(base + '.p.npy'), PR.load_pruner(base + '.lgb')
+        cols, imp = load_json(base + '.cols.json'), load_json(base + '.imp.json')
+    else:
+        emb = {n: get_embeddings(cfg, W, n, Wtr) for n in plan['emb']}
+        with Timer(f'stage-1 cheap features for {len(cand):,} stage-0 pairs'):
+            X, cols = PR.cheap_features(cand, W, emb, plan['passes'], cfg['retr']['alpha_name'], pc['pool_ctx'])
+        fold = W['q_fold'][qi]
+        rows = {f: np.flatnonzero(fold == f) for f in ('fit', 'tune', 'hold')}
+        q_hash = (pd.util.hash_array(W['Q'].entity_id.astype(object).to_numpy()) % 2).astype(np.int64)
+        p, m = PR.fit_pruner(X, y, qi, rows, q_hash, pc, cfg['seed'])
+        del X
+        imp = dict(zip(cols, map(float, m.importance())))
+        np.save(base + '.p.npy', p); PR.save_pruner(m, base + '.lgb')
+        save_json(cols, base + '.cols.json'); save_json(imp, base + '.imp.json')
+        open(base + '.DONE', 'w').close()
+    qr, pr = PR.ranks_of(p, qi, pi, pc['pool_ctx'])
+    return dict(key=os.path.basename(base), cand=cand, y=y, p=p, qr=qr, pr=pr, model=m, cols=cols, imp=imp)
+
+
+def stage1_features(cfg, W, plan, S1, keep, tag, Wtr=None):
+    """Matcher features (incl. pr_p) for the stage-1 survivors `keep` (bool mask over the stage-0 union). Cached."""
+    key = 'feats1_' + cfg_hash(dict(s=S1['key'], tag=tag, n=int(keep.sum())))
+    fx, fc, fcand = (os.path.join(W['dir'], key + s) for s in ('.npy', '.cols.json', '.cand.parquet'))
+    if os.path.exists(fx):
+        return pd.read_parquet(fcand), pd.DataFrame(np.asarray(np.load(fx, mmap_mode='r')), columns=load_json(fc))
+    cand = S1['cand'][keep].reset_index(drop=True)
+    emb = {n: get_embeddings(cfg, W, n, Wtr) for n in plan['emb']}
+    with Timer(f'matcher features for {len(cand):,} stage-1 survivors'):
+        F, _ = FT.compute_features(cand, W, plan['passes'], emb, prune=False, chunk=cfg['feats']['chunk'],
+                                   alpha=cfg['retr']['alpha_name'], extra={'pr_p': S1['p'][keep]})
+    np.save(fx, F.to_numpy(np.float32)); save_json(list(F.columns), fc); cand.to_parquet(fcand, index=False)
+    return cand, F
+
+
+def subset_context(cand, F, sub, passes):
+    """Rows `sub` of a survivor set; recomputes the within-S1 context features on the smaller set (as at inference)."""
+    cand, F = cand.iloc[sub].reset_index(drop=True), FT.drop_context(F.iloc[sub].reset_index(drop=True))
+    FT.add_context(F, cand.qi.to_numpy(), cand.bits.to_numpy(), passes)
+    return cand, F

@@ -9,6 +9,7 @@ import pandas as pd
 from . import pipeline as PL
 from . import features as FT
 from . import evaluate as EV
+from . import prune as PR
 from .models import Model
 from .utils import Timer, log, save_json
 
@@ -115,13 +116,30 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
     cand = B.union_candidates(pdfs, plan['K'], Wte['NP'])
     del pdfs
     emb = {n: PL.get_embeddings(cfg, Wte, n, Wtr) for n in plan['emb']}
+    per_q = lambda c: np.bincount(c.qi.to_numpy(), minlength=Wte['NQ'])
+    crow = lambda name, c: dict(stage=name, pairs=len(c), avg_per_S1=per_q(c).mean(), p50=float(np.median(per_q(c))),
+                                p95=float(np.percentile(per_q(c), 95)), max=int(per_q(c).max()), S1_empty_pct=100 * (per_q(c) == 0).mean())
+    crows = [crow('stage 0 retrieval union', cand)]
+    extra = None
+    if plan.get('stage1'):
+        st = ctx.stage1
+        with Timer(f'test stage-1 pruner on {len(cand):,} pairs'):
+            X1, cols1 = PR.cheap_features(cand, Wte, emb, plan['passes'], cfg['retr']['alpha_name'], cfg['prune1']['pool_ctx'])
+            assert cols1 == st['cols'], 'stage-1 feature columns differ between train and test'
+            p1s = PR.predict_rows(st['model'], X1, np.arange(len(cand)))
+            del X1
+            qr, pr = PR.ranks_of(p1s, cand.qi.to_numpy(), cand.pi.to_numpy(), cfg['prune1']['pool_ctx'])
+            keep1 = PR.cut_mask(p1s, qr, pr, st['cut'])
+            cand, extra = cand[keep1].reset_index(drop=True), {'pr_p': p1s[keep1]}
+        crows.append(crow(f"stage 1 pruner {st['cut']}", cand))
+    rep.table('test candidates per S1 (last row = candidate_pairs.tsv)', pd.DataFrame(crows).set_index('stage'), short=True)
     log(f'test candidates: {len(cand):,} ({len(cand) / Wte["NQ"]:.1f}/S1)')
     with Timer('test features + scoring'):
         if use_s2:
             s1m = models[0]
             p1t, keepm, KEEP = FT.compute_features(cand, Wte, plan['passes'], emb, prune=plan['prune'], chunk=cfg['feats']['chunk'],
                                                    scorer=lambda F: s1m.predict(F[feats].to_numpy(np.float32)), keep_cols=keep,
-                                                   alpha=cfg['retr']['alpha_name'])
+                                                   alpha=cfg['retr']['alpha_name'], extra=extra)
             cand = cand[keepm].reset_index(drop=True)
             qi, pi = cand.qi.to_numpy(), cand.pi.to_numpy()
             s3 = (Wte['P'].src.to_numpy()[pi] == 3).astype(np.int64)
@@ -133,7 +151,7 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
         else:
             PT, keepm, _ = FT.compute_features(cand, Wte, plan['passes'], emb, prune=plan['prune'], chunk=cfg['feats']['chunk'],
                                                scorer=lambda F: np.mean([m.predict(F[feats].to_numpy(np.float32)) for m in models], axis=0),
-                                               alpha=cfg['retr']['alpha_name'])
+                                               alpha=cfg['retr']['alpha_name'], extra=extra)
             cand = cand[keepm].reset_index(drop=True)
             qi, pi = cand.qi.to_numpy(), cand.pi.to_numpy()
     s3b = Wte['P'].src.to_numpy()[pi] == 3
