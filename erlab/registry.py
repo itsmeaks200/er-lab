@@ -129,3 +129,51 @@ OVERNIGHT = dict(
          'SUMMARY'],
     sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True'],   # = FULL
 )
+
+
+# ------------------------------------------------------------------ day 2: feature engineering + LLM matchers
+# Reuses every day-1 cache (world, passes, stage 1, test candidates, e5-small cross-encoder scores); only the new matcher
+# features (FE2) and the LLM scores are computed. LLMs: Qwen2.5-1.5B / Qwen2.5-7B (Apache-2.0, <=8B params) as sequence
+# classifiers with LoRA (7B: 4-bit QLoRA, needs bitsandbytes), trained on the enc fold, scoring the uncertain pairs.
+FE2 = {'feats': {'fe2': True}}
+QWEN15 = {'crossenc': {'enabled': True, 'arch': 'llm', 'model': 'Qwen/Qwen2.5-1.5B', 'max_len': 128, 'batch': 16, 'grad_accum': 2,
+                       'lr': 1e-4, 'lora_r': 16, 'epochs': 1, 'neg_per_pos': 3, 'max_train_pairs': 150_000, 'train_minutes': 75,
+                       'band': [0.02, 0.98], 'top_n': 8, 'max_pred_pairs': 400_000, 'pred_batch': 64}}
+QWEN7 = {'crossenc': {'enabled': True, 'arch': 'llm', 'model': 'Qwen/Qwen2.5-7B', 'load_4bit': True, 'max_len': 128, 'batch': 8,
+                      'grad_accum': 4, 'lr': 1e-4, 'lora_r': 16, 'epochs': 1, 'neg_per_pos': 3, 'max_train_pairs': 60_000,
+                      'train_minutes': 90, 'band': [0.05, 0.95], 'top_n': 6, 'max_pred_pairs': 120_000, 'pred_batch': 32}}
+_S2 = dict(models=[dict(kind='lgb', params={})], stage2=True)
+EXPERIMENTS.update({
+    'SUB7': dict(wave=6, kind='submit', desc='A7: A1 + FE2 features (unmatched-token IDF, legal form, name numbers, duplicates, pool ranks)',
+                 cfg=_deep(FULL, FE2), args=dict(models=[dict(kind='lgb', params={})])),
+    'SUB8': dict(wave=6, kind='submit', desc='A8: A3 stage-2 reranker + FE2', cfg=_deep(FULL, FE2), args=dict(_S2)),
+    'SUB9': dict(wave=6, kind='submit', desc='A9: A8 + Qwen2.5-1.5B LoRA judge (Apache-2.0) on uncertain pairs',
+                 cfg=_deep(FULL, FE2, QWEN15), args=dict(_S2, crossenc=True)),
+    'SUB10': dict(wave=6, kind='submit', desc='A10: A8 + e5-small cross-encoder + Qwen2.5-1.5B (two text scores stacked)',
+                  cfg=_deep(FULL, FE2, CE_SMALL), args=dict(_S2, crossenc=True, extra_crossenc=[QWEN15['crossenc']])),
+    'SUB11': dict(wave=6, kind='submit', desc='A11: A8 + Qwen2.5-7B 4-bit QLoRA judge (Apache-2.0, 7.6B) on the hardest pairs',
+                  cfg=_deep(FULL, FE2, QWEN7), args=dict(_S2, crossenc=True)),
+    'SUB12': dict(wave=6, kind='submit', desc='A12: GBDT trio (LightGBM tuned by M12 + XGBoost + CatBoost) + FE2',
+                  cfg=_deep(FULL, FE2), args=dict(models=[dict(kind='lgb', params={}, params_file='M12_best_params.json'),
+                                                          dict(kind='xgb', params={}), dict(kind='cat', params={})])),
+    'SUB13': dict(wave=6, kind='submit', desc='A13: A8 + e5-small + Qwen2.5-1.5B + Qwen2.5-7B (all text scores stacked)',
+                  cfg=_deep(FULL, FE2, CE_SMALL), args=dict(_S2, crossenc=True, extra_crossenc=[QWEN15['crossenc'], QWEN7['crossenc']])),
+    'M10F': dict(wave=6, kind='ablation', desc='feature-group ablation incl. the FE2 block (quick LightGBM, 100k fit S1)',
+                 cfg=_deep(FULL, FE2), args=dict(n_s1=100_000, groups=['fe2', 'fe2_pool', 'fuzzy', 'embeddings', 'commonness',
+                                                                      'context', 'numeric_postal', 'noise_flags'])),
+})
+
+DAY2 = dict(
+    ids=['SUB7',        # FE2 on the LightGBM matcher (compare with SUB1)
+         'SUB8',        # FE2 on the stage-2 reranker (compare with SUB3)
+         'SUB9',        # + Qwen2.5-1.5B judge
+         'M10F',        # which feature groups matter
+         'SUB10',       # e5-small + Qwen1.5B stacked (both cached -> cheap)
+         'SUB12',       # GBDT trio with tuned LightGBM + FE2
+         'SUMMARY',
+         'SUB11',       # Qwen2.5-7B QLoRA (slowest)
+         'SUB13',       # all text scores stacked (all cached -> cheap)
+         'SUMMARY'],
+    sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True', 'feats.fe2=True'],
+)
+PLANS = {'overnight': OVERNIGHT, 'day2': DAY2}

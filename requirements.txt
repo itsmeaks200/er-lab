@@ -17,3 +17,7 @@ torch>=2.1
 transformers>=4.40
 sentence-transformers>=3.0
 hf_xet
+# day 2: LLM judges (LoRA / 4-bit QLoRA)
+peft>=0.11
+accelerate>=0.30
+bitsandbytes>=0.43

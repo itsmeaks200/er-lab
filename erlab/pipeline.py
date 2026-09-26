@@ -323,64 +323,92 @@ def keys_of(d, NP):
     return np.unique(d.qi.to_numpy(np.int64) * NP + d.pi.to_numpy(np.int64))
 
 
-def cand_stats(W, name, keys):
+def cand_stats(W, name, keys, q_sel=None):
+    """Candidate-set quality. q_sel (bool mask over queries): restrict to a sample of S1 (fast on the full world)."""
     NP, NQ = W['NP'], W['NQ']
-    hit = np.isin(W['gt_keys'], keys)
+    gt, gf = W['gt_keys'], W['gt_fold']
+    if q_sel is not None:
+        keys = keys[q_sel[(keys // NP).astype(np.int64)]]
+        m = q_sel[W['gt_qi']]
+        gt, gf = gt[m], gf[m]
+    hit = np.isin(gt, keys)
     per_q = np.bincount((keys // NP).astype(np.int64), minlength=NQ)
+    per_q = per_q[q_sel] if q_sel is not None else per_q
+    ck = W['q_ck'] if q_sel is None else W['q_ck'][q_sel]
     pool_c = {c: e - s for c, (s, e) in W['p_slices'].items()}
-    total = float(sum(pool_c.get(c, NP) for c in W['q_ck']))
-    r = dict(strategy=name, pairs=len(keys), recall=hit.mean())
+    total = float(sum(pool_c.get(c, NP) for c in ck))
+    r = dict(strategy=name, pairs=len(keys), recall=hit.mean() if len(hit) else float('nan'))
     for f in ('fit', 'tune', 'hold'):
-        r['recall_' + f] = hit[W['gt_fold'] == f].mean()
+        r['recall_' + f] = hit[gf == f].mean() if (gf == f).any() else float('nan')
     r.update(avg_per_S1=per_q.mean(), p50_per_S1=float(np.median(per_q)), p95_per_S1=np.percentile(per_q, 95), max_per_S1=int(per_q.max()),
              S1_no_cand_pct=100 * (per_q == 0).mean(), reduction=1 - len(keys) / max(total, 1), missed=int((~hit).sum()))
+    if q_sel is not None:
+        r['S1_sampled'] = int(q_sel.sum())
     return r
 
 
 def select_blocking(cfg, W, pass_dfs):
-    """K per ranked pass from recall@K; passes chosen greedily on FIT-fold recall (labels only measure recall)."""
-    bc, NP = cfg['block'], W['NP']
-    rows, curves, K_sel = [], {}, {}
+    """Budgeted greedy choice of (pass, K) on a sample of FIT-fold S1 (labels only measure recall): at each step add the
+    option with the best recall gain per extra candidate/S1, as long as the union stays within block.max_per_S1 and the
+    gain is at least block.greedy_min_gain. Larger K of an already chosen pass is an option too."""
+    bc, NP, NQ = cfg['block'], W['NP'], W['NQ']
+    rng = np.random.RandomState(cfg['seed'])
+    fit_q = np.flatnonzero(W['q_fold'] == 'fit')
+    samp = np.sort(rng.choice(fit_q, min(bc.get('select_sample', 60_000), len(fit_q)), replace=False))
+    in_s = np.zeros(NQ, bool); in_s[samp] = True
+    all_q = np.flatnonzero(np.isin(W['q_fold'], ['fit', 'tune', 'hold']))
+    tab_s = np.zeros(NQ, bool); tab_s[np.sort(rng.choice(all_q, min(bc.get('select_sample', 60_000) * 2, len(all_q)), replace=False))] = True
+    gt_s = W['gt_keys'][in_s[W['gt_qi']]]
+    n_s, n_gt = len(samp), max(len(gt_s), 1)
+    grid = [K for K in bc['k_grid'] if K <= bc['topk_max']]
+    rows, curves, opts = [], {}, {}
     for p, d in pass_dfs.items():
-        rows.append(cand_stats(W, B.PASS_NAMES[p], keys_of(d, NP)))
+        rows.append(cand_stats(W, B.PASS_NAMES[p], keys_of(d, NP), tab_s))
+        ds = d[in_s[d.qi.to_numpy()]]
         if p in B.KEY_PASSES:
-            K_sel[p] = None
+            opts[(p, None)] = keys_of(ds, NP)
             continue
-        grid = [K for K in bc['k_grid'] if K <= bc['topk_max']]
-        curves[p] = [np.isin(W['gt_keys'], keys_of(d[d['rank'] < K], NP)).mean() for K in grid]
-        if p in bc['k']:
-            K_sel[p] = bc['k'][p]
-        else:
-            tgt = bc['k_keep'] * curves[p][-1]
-            K_sel[p] = next(K for K, r in zip(grid, curves[p]) if r >= tgt)
+        Ks = [bc['k'][p]] if p in bc['k'] else grid
+        curves[p] = []
+        for K in grid:
+            k_ = keys_of(ds[ds['rank'] < K], NP)
+            curves[p].append(np.isin(gt_s, k_).mean())
+            if K in Ks:
+                opts[(p, K)] = k_
     table = pd.DataFrame(rows).set_index('strategy')
-    curve_df = pd.DataFrame(curves, index=[K for K in bc['k_grid'] if K <= bc['topk_max']])
-    is_fit_q = W['q_fold'] == 'fit'
-    fit_gt = W['gt_fold'] == 'fit'
-    pk = {}
-    for p, d in pass_dfs.items():
-        dd = d if K_sel[p] is None else d[d['rank'] < K_sel[p]]
-        k = keys_of(dd, NP)
-        pk[p] = k[is_fit_q[(k // NP).astype(np.int64)]]
+    curve_df = pd.DataFrame(curves, index=grid)
     if bc['select'] == 'all':
-        selected, hist = list(pass_dfs), []
-    else:
-        selected, cur, cur_rec, hist = [], np.empty(0, np.int64), 0.0, []
-        while True:
-            best = None
-            for p in pk:
-                if p in selected:
-                    continue
-                u = np.union1d(cur, pk[p])
-                r = np.isin(W['gt_keys'][fit_gt], u).mean()
-                if best is None or r > best[1]:
-                    best = (p, r, u)
-            if best is None or best[1] - cur_rec < bc['greedy_min_gain']:
-                break
-            selected.append(best[0]); cur, cur_rec = best[2], best[1]
-            hist.append(dict(step=len(selected), added=B.PASS_NAMES[best[0]], fit_recall=round(cur_rec, 5),
-                             pairs_per_S1=round(len(cur) / max(is_fit_q.sum(), 1), 1)))
-    return dict(K={p: K_sel[p] for p in selected}, passes=selected, table=table, curves=curve_df, greedy=pd.DataFrame(hist))
+        K_sel = {p: (None if p in B.KEY_PASSES else max(K for (q, K) in opts if q == p)) for p in pass_dfs}
+        return dict(K=K_sel, passes=list(pass_dfs), table=table, curves=curve_df, greedy=pd.DataFrame())
+    budget = bc.get('max_per_S1', 60) * n_s
+    hit_opt = {o: np.isin(gt_s, k_) for o, k_ in opts.items()}
+    sel, cur, cur_hit, hist = {}, np.empty(0, np.int64), np.zeros(len(gt_s), bool), []
+    while True:
+        best = None
+        for o, k_ in opts.items():
+            p, K = o
+            if p in sel and (K is None or sel[p] is None or K <= sel[p]):
+                continue
+            gain = (hit_opt[o] & ~cur_hit).sum() / n_gt
+            if gain < bc['greedy_min_gain']:
+                continue
+            add = len(k_) - int(np.isin(k_, cur, assume_unique=True).sum())
+            if len(cur) + add > budget:
+                continue
+            score = gain / max(add / n_s, 0.25)             # recall per extra candidate per S1
+            if best is None or score > best[0]:
+                best = (score, o, gain, add)
+        if best is None:
+            break
+        _, (p, K), gain, add = best
+        sel[p] = K
+        cur = np.union1d(cur, opts[(p, K)])
+        cur_hit |= hit_opt[(p, K)]
+        hist.append(dict(step=len(hist) + 1, added=f'{B.PASS_NAMES[p]}' + (f' K={K}' if K else ''), gain=round(gain, 5),
+                         fit_recall=round(cur_hit.mean(), 5), pairs_per_S1=round(len(cur) / n_s, 1)))
+    log(f'   blocking plan (sample of {n_s:,} fit S1, budget {bc.get("max_per_S1", 60)}/S1): {sel} -> recall '
+        f'{cur_hit.mean():.4f} at {len(cur) / n_s:.1f} cands/S1')
+    return dict(K=dict(sel), passes=list(sel), table=table, curves=curve_df, greedy=pd.DataFrame(hist))
 
 
 # ============================================================ features
@@ -393,7 +421,7 @@ def feat_key(cfg, W, plan):
 
 def get_features(cfg, W, pass_dfs, plan, Wtr=None):
     """Candidate union + pair features (cached as float32 .npy + columns json + candidate parquet)."""
-    key = feat_key(cfg, W, plan)
+    key = feat_key(cfg, W, plan) + ('_fe2' if fe2_on(cfg) else '')
     fx, fc, fcand = (os.path.join(W['dir'], key + s) for s in ('.npy', '.cols.json', '.cand.parquet'))
     if os.path.exists(fx):
         X = np.load(fx, mmap_mode='r')
@@ -404,7 +432,7 @@ def get_features(cfg, W, pass_dfs, plan, Wtr=None):
     emb = {n: get_embeddings(cfg, W, n, Wtr) for n in plan['emb']}
     with Timer(f'features for {len(cand):,} candidate pairs'):
         F, _ = FT.compute_features(cand, W, plan['passes'], emb, prune=False, chunk=cfg['feats']['chunk'],
-                                   alpha=cfg['retr']['alpha_name'])
+                                   alpha=cfg['retr']['alpha_name'], fe2=fe2_on(cfg))
     np.save(fx, F.to_numpy(np.float32)); save_json(list(F.columns), fc); cand.to_parquet(fcand, index=False)
     return cand, F
 
@@ -420,6 +448,15 @@ def apply_prune(cand, F, y, plan):
     F = FT.drop_context(F)
     FT.add_context(F, cand.qi.to_numpy(), cand.bits.to_numpy(), plan['passes'])
     return cand, F, y
+
+
+def fe2_on(cfg):
+    return bool(cfg['feats'].get('fe2', False))
+
+
+def pool_feats_on(cfg):
+    """Matcher pool-side ranks: only valid when the world holds every S1 of the split (prune1.pool_ctx worlds)."""
+    return fe2_on(cfg) and bool(cfg['prune1'].get('pool_ctx', False))
 
 
 # ============================================================ stage 1: learned blocking (erlab/prune.py)
@@ -457,7 +494,7 @@ def run_stage1(cfg, W, pdfs, plan, Wtr=None):
 
 def stage1_features(cfg, W, plan, S1, keep, tag, Wtr=None):
     """Matcher features (incl. pr_p) for the stage-1 survivors `keep` (bool mask over the stage-0 union). Cached."""
-    key = 'feats1_' + cfg_hash(dict(s=S1['key'], tag=tag, n=int(keep.sum())))
+    key = 'feats1_' + cfg_hash(dict(s=S1['key'], tag=tag, n=int(keep.sum()), fe2=fe2_on(cfg), pool=pool_feats_on(cfg)))
     fx, fc, fcand = (os.path.join(W['dir'], key + s) for s in ('.npy', '.cols.json', '.cand.parquet'))
     if os.path.exists(fx):
         return pd.read_parquet(fcand), pd.DataFrame(np.asarray(np.load(fx, mmap_mode='r')), columns=load_json(fc))
@@ -465,13 +502,18 @@ def stage1_features(cfg, W, plan, S1, keep, tag, Wtr=None):
     emb = {n: get_embeddings(cfg, W, n, Wtr) for n in plan['emb']}
     with Timer(f'matcher features for {len(cand):,} stage-1 survivors'):
         F, _ = FT.compute_features(cand, W, plan['passes'], emb, prune=False, chunk=cfg['feats']['chunk'],
-                                   alpha=cfg['retr']['alpha_name'], extra={'pr_p': S1['p'][keep]})
+                                   alpha=cfg['retr']['alpha_name'], extra={'pr_p': S1['p'][keep]}, fe2=fe2_on(cfg))
+        if pool_feats_on(cfg):
+            FT.add_pool_context(F, cand.pi.to_numpy())
     np.save(fx, F.to_numpy(np.float32)); save_json(list(F.columns), fc); cand.to_parquet(fcand, index=False)
     return cand, F
 
 
-def subset_context(cand, F, sub, passes):
-    """Rows `sub` of a survivor set; recomputes the within-S1 context features on the smaller set (as at inference)."""
+def subset_context(cand, F, sub, passes, pool=False):
+    """Rows `sub` of a survivor set; recomputes the within-S1 (and within-pool-record) context features on the smaller
+    set, exactly as they are computed at inference."""
     cand, F = cand.iloc[sub].reset_index(drop=True), FT.drop_context(F.iloc[sub].reset_index(drop=True))
     FT.add_context(F, cand.qi.to_numpy(), cand.bits.to_numpy(), passes)
+    if pool:
+        FT.add_pool_context(F, cand.pi.to_numpy())
     return cand, F

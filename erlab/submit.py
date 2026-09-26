@@ -119,11 +119,15 @@ def holdout_report(ctx, rep, res, rule, ph, out, extra):
 
 
 # ============================================================ stage 2 / cross-encoder helpers
-def stage2_matrix(ctx, p1, keep, ce, rows):
+def ce_name(j):
+    return 'ce' if j == 0 else f'ce{j + 1}'
+
+
+def stage2_matrix(ctx, p1, keep, ces, rows):
     S = FT.stage2_frame(ctx.qi[rows], ctx.pi[rows], ctx.s3[rows].astype(np.int64), p1[rows], ctx.W['P'], ctx.W['Pm'],
                         ctx.F[keep].iloc[rows])
-    if ce is not None:
-        S['ce'] = ce[rows]
+    for j, ce in enumerate(ces or []):
+        S[ce_name(j)] = ce[rows]
     return S
 
 
@@ -188,6 +192,7 @@ def test_candidates_and_features(cfg, ctx, rep):
     st = ctx.stage1
     key = 'testset_' + cfg_hash(dict(w=Wte['dir'], passes=plan['passes'], K=plan['K'], emb=plan['emb'], prune=plan.get('prune'),
                                      st1=st['key'] if st else None, cut=st['cut'] if st else None, v=cfg['feats']['version'],
+                                     fe2=PL.fe2_on(cfg), pool=PL.pool_feats_on(cfg),
                                      enc=PL.encoder_key(cfg), pk={p: PL.pass_key(cfg, Wte, p) for p in plan['passes']}))
     if _TEST.get('key') == key:
         return Wte, _TEST['cand'], _TEST['F'], _TEST['crows']
@@ -220,15 +225,49 @@ def test_candidates_and_features(cfg, ctx, rep):
             crows.append(crow(f"stage 1 pruner {st['cut']}", cand))
         with Timer(f'test matcher features for {len(cand):,} pairs'):
             F, keepm = FT.compute_features(cand, Wte, plan['passes'], emb, prune=plan.get('prune', False),
-                                           chunk=cfg['feats']['chunk'], alpha=cfg['retr']['alpha_name'], extra=extra)
+                                           chunk=cfg['feats']['chunk'], alpha=cfg['retr']['alpha_name'], extra=extra,
+                                           fe2=PL.fe2_on(cfg))
         if not keepm.all():
             cand = cand[keepm].reset_index(drop=True)
             crows.append(crow('after safe-zone pruning', cand))
+        if PL.pool_feats_on(cfg):
+            FT.add_pool_context(F, cand.pi.to_numpy())
         np.save(base + '.npy', F.to_numpy(np.float32)); save_json(list(F.columns), base + '.cols.json')
         cand.to_parquet(base + '.cand.parquet', index=False); save_json(crows, base + '.crows.json')
         open(base + '.DONE', 'w').close()
     _TEST.update(key=key, cand=cand, F=F, crows=crows)
     return Wte, cand, F, crows
+
+
+def crossenc_both(cfg, ctx, cc, rep, Wte, cand_te, F_te):
+    """Train-world and test scores of one cross-encoder / LLM, cached on disk (the most expensive step; approaches that
+    share a text model reuse it). The model is freed right after scoring so the next, larger one fits on the GPU."""
+    key = cfg_hash(dict(st=ctx.stage1['key'] if ctx.stage1 else None, cut=ctx.stage1['cut'] if ctx.stage1 else None, cc=cc,
+                        ef=cfg['world'].get('enc_frac', 0), seed=cfg['seed'], n=len(ctx.y), test=Wte['dir'], nt=len(cand_te), v=1))
+    path = os.path.join(cfg['paths']['cache_dir'], 'crossenc', f'ce_{key}.npz')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        z = np.load(path)
+        ce, ce_t = z['ce'], z['ce_t']
+        log(f"cross-encoder {cc['model']}: loaded cached scores")
+    else:
+        ce, obj = crossenc_scores(ctx, cc, rep)
+        ce_t = crossenc_test(obj, cc, Wte, cand_te, F_te)
+        np.savez(path, ce=ce, ce_t=ce_t)
+        del obj
+        try:
+            import gc
+            import torch
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    from sklearn.metrics import roc_auc_score
+    h = ctx.rows['hold'][~np.isnan(ce[ctx.rows['hold']])]
+    auc = roc_auc_score(ctx.y[h], ce[h]) if len(h) and 0 < ctx.y[h].mean() < 1 else float('nan')
+    rep.text(f"text model {cc['model']} ({cc.get('arch', 'encoder')}): hold AUC {auc:.5f} on {len(h):,} scored hold pairs | "
+             f"test pairs scored {int((~np.isnan(ce_t)).sum()):,}", short=True)
+    return ce, ce_t
 
 
 def crossenc_test(ce_obj, cc, Wte, cand, F):
@@ -269,14 +308,21 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
             else:
                 rep.text(f'{pf} not found → default params', short=True)
     use_s2, use_ce = bool(args.get('stage2')), bool(args.get('crossenc'))
+    from .config import deep_merge
+    ce_cfgs = ([cfg['crossenc']] if use_ce else []) + [deep_merge(cfg['crossenc'], ex) for ex in args.get('extra_crossenc', [])]
+    if ce_cfgs and not use_s2:
+        raise ValueError('cross-encoder scores are stacked by the stage-2 model: set stage2=True')
     rf, rt, rh = ctx.rows['fit'], ctx.rows['tune'], ctx.rows['hold']
     all_rows = np.sort(np.r_[rf, rt, rh])
-    rep.text(f"approach {rep.exp_id}: models={[s['kind'] for s in specs]} stage2={use_s2} crossenc={use_ce} | "
+    rep.text(f"approach {rep.exp_id}: models={[s['kind'] for s in specs]} stage2={use_s2} "
+             f"text models={[c['model'] for c in ce_cfgs]} | "
              f"{len(feats)} features | rows fit {len(rf):,} / tune {len(rt):,} / hold {len(rh):,} / enc (excluded) "
              f"{int((ctx.fold == 'enc').sum()):,} | train S1 {W['NQ']:,}", short=True)
-    ce = ce_obj = None
-    if use_ce:
-        ce, ce_obj = crossenc_scores(ctx, cfg['crossenc'], rep)
+    ces, ces_t = [], []
+    for cc in ce_cfgs:
+        Wte, cand_te, F_te, _ = test_candidates_and_features(cfg, ctx, rep)
+        ce, ce_t = crossenc_both(cfg, ctx, cc, rep, Wte, cand_te, F_te)
+        ces.append(ce); ces_t.append(ce_t)
 
     # ---------------- phase 1: holdout
     t1 = time.time()
@@ -287,7 +333,7 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
             imp = m1.importance()
             keep = (list(pd.Series(imp, index=feats).sort_values(ascending=False).index[:cfg['stage2']['keep_feats']])
                     if imp is not None else feats[:cfg['stage2']['keep_feats']])
-            S2 = stage2_matrix(ctx, p1, keep, ce, np.arange(len(y)))
+            S2 = stage2_matrix(ctx, p1, keep, ces, np.arange(len(y)))
             s2cols = list(S2.columns)
             X2 = lambda r: S2.iloc[r].to_numpy(np.float32)
             tr = cap_rows(ctx, rf, mcfg['max_train_rows'])
@@ -332,7 +378,7 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
             m1f = Model(mc['kind'], mc['params'], R1, 10 ** 9, cfg['seed'], feats).fit_fixed(X_of(ctx, tr_all, feats), y[tr_all], ctx.qi[tr_all])
             p1r = np.zeros(len(y), np.float32)
             p1r[tr_all] = oof_fixed(ctx, mc, feats, tr_all, R1, X_of)
-            S2r = stage2_matrix(ctx, p1r, keep, ce, tr_all)
+            S2r = stage2_matrix(ctx, p1r, keep, ces, tr_all)
             m2f = Model('lgb', dict(num_leaves=63), refit_rounds(m2.best_iter), 10 ** 9, cfg['seed'], s2cols)
             m2f.fit_fixed(S2r[s2cols].to_numpy(np.float32), y[tr_all])
             del S2r
@@ -357,10 +403,9 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
     with Timer(f'{rep.exp_id} phase 3: score {len(cand):,} test pairs'):
         if use_s2:
             p1t = m1f.predict(F[feats].to_numpy(np.float32)).astype(np.float32)
-            ce_t = crossenc_test(ce_obj, cfg['crossenc'], Wte, cand, F) if use_ce else None
             S2t = FT.stage2_frame(qi, pi, s3b.astype(np.int64), p1t, Wte['P'], Wte['Pm'], F[keep])
-            if ce_t is not None:
-                S2t['ce'] = ce_t
+            for j, ce_t in enumerate(ces_t):
+                S2t[ce_name(j)] = ce_t
             PT = m2f.predict(S2t[s2cols].to_numpy(np.float32)).astype(np.float32)
             del S2t
         else:
@@ -403,7 +448,7 @@ def submit(cfg, rep, args, build_ctx, feature_list, X_of, cap_rows, evaluate_sco
     minutes = dict(holdout=round((t2 - t1) / 60, 1), refit=round((t3 - t2) / 60, 1), test=round((time.time() - t3) / 60, 1),
                    total=round((time.time() - t0) / 60, 1))
     save_json(dict(exp=rep.exp_id, desc=rep.desc, plan={k: v for k, v in ctx.plan.items()}, stage1_cut=ctx.stage1['cut'] if ctx.stage1 else None,
-                   models=specs, stage2=use_s2, crossenc=use_ce, rule=rule, prm=prm, holdout=summ, refit=refit_desc,
+                   models=specs, stage2=use_s2, text_models=[c['model'] for c in ce_cfgs], rule=rule, prm=prm, holdout=summ, refit=refit_desc,
                    test_candidates=crows, test_stats=stats, valid=ok, minutes=minutes), os.path.join(out, 'submission_meta.json'))
     row = dict(exp=rep.exp_id, desc=rep.desc, hold_F05=round(summ['hold_F05'], 5), hold_P=round(summ['hold_P_micro'], 4),
                hold_R=round(summ['hold_R_micro'], 4), singleton_acc=round(summ['singleton_acc'], 4), tune_F05=round(summ['tune_F05'], 5),

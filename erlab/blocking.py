@@ -65,13 +65,64 @@ def _topk_rows_np(indptr, indices, data, k):
             np.concatenate(K_))
 
 
+def _spmm_topk_py(q_indptr, q_indices, q_data, pt_indptr, pt_indices, pt_data, n_pool, k, nthreads):
+    """Fused sparse retrieval: for every query row, accumulate scores over the posting lists of its tokens into a dense
+    per-thread buffer, keep the top-k. Parallel over query blocks (numba prange); never materialises the score matrix."""
+    nq = len(q_indptr) - 1
+    out_c = np.full((nq, k), -1, np.int32)
+    out_s = np.zeros((nq, k), np.float32)
+    out_n = np.zeros(nq, np.int32)
+    per = (nq + nthreads - 1) // nthreads
+    for t in prange(nthreads):
+        acc = np.zeros(n_pool, np.float32)
+        touched = np.empty(n_pool, np.int32)
+        for i in range(t * per, min(nq, (t + 1) * per)):
+            nt = 0
+            for jj in range(q_indptr[i], q_indptr[i + 1]):
+                tok = q_indices[jj]
+                w = q_data[jj]
+                for pp in range(pt_indptr[tok], pt_indptr[tok + 1]):
+                    c = pt_indices[pp]
+                    if acc[c] == 0.0:
+                        touched[nt] = c
+                        nt += 1
+                    acc[c] += w * pt_data[pp]
+            if nt > 0:
+                vals = np.empty(nt, np.float32)
+                for u in range(nt):
+                    vals[u] = acc[touched[u]]
+                m = k if nt > k else nt
+                order = np.argsort(-vals, kind='mergesort')
+                for u in range(m):
+                    out_c[i, u] = touched[order[u]]
+                    out_s[i, u] = vals[order[u]]
+                out_n[i] = m
+                for u in range(nt):
+                    acc[touched[u]] = 0.0
+    return out_c, out_s, out_n
+
+
 try:
     import numba
+    from numba import prange
     _topk_rows = numba.njit(_topk_rows_py)
+    _spmm_topk = numba.njit(parallel=True, cache=True)(_spmm_topk_py)
     HAS_NUMBA = True
 except Exception:
+    prange = range
     _topk_rows = _topk_rows_np
+    _spmm_topk = None
     HAS_NUMBA = False
+
+
+def spmm_topk(Q, PT, k, nthreads=None):
+    """Top-k of Q @ PT per row (Q: queries x tokens CSR, PT: tokens x pool CSR) with the parallel kernel."""
+    Q, PT = Q.tocsr(), PT.tocsr()
+    nthreads = nthreads or numba.get_num_threads()
+    c, v, n = _spmm_topk(Q.indptr.astype(np.int64), Q.indices.astype(np.int32), Q.data.astype(np.float32),
+                         PT.indptr.astype(np.int64), PT.indices.astype(np.int32), PT.data.astype(np.float32),
+                         PT.shape[1], k, max(1, min(nthreads, Q.shape[0])))
+    return c, v, n
 
 
 def topk_csr(S, k):
@@ -122,11 +173,35 @@ def sparse_passes(Qm, Pm, q_rows, q_ck, p_slices, R, k, which, cfg):
     which = [p for p in which if p in SPARSE_PASSES]
     out = {p: [] for p in which}
     need = {'name': any(p in which for p in 'CF'), 'addr': any(p in which for p in 'DF'), 'char': 'I' in which}
+    parallel = HAS_NUMBA and rc.get('parallel', True)
     for c, rows_c, ps, pe in country_groups(np.asarray(q_rows), q_ck, p_slices, Pm['ntok'].shape[0]):
         t = time.time()
         log(f'   sparse {which} [{c}]: preparing pool matrices ({pe - ps:,} pool records)')
         PT = {f: retr_mat(Pm, slice(ps, pe), RETR_FIELDS[f], R['W'], 'p', bm25).T.tocsr() for f in need if need[f]}
-        pg = Progress(f'sparse {which} [{c}]', len(rows_c), 'queries')
+        pg = Progress(f'sparse {which} [{c}]' + (' parallel' if parallel else ''), len(rows_c), 'queries')
+        if parallel:        # fused parallel kernel on all cores; F = [a*name, (1-a)*addr] . [name; addr]
+            if 'F' in which:
+                PT['comb'] = sp.vstack([PT['name'], PT['addr']], format='csr')
+            pchunk = max(chunk, 200_000)
+            for s in range(0, len(rows_c), pchunk):
+                qi = rows_c[s:s + pchunk]
+                QM = {f: retr_mat(Qm, qi, RETR_FIELDS[f], R['W'], 'q', bm25) for f in need if need[f]}
+                todo = [(p_, QM['name'], PT['name']) for p_ in 'C' if p_ in which]
+                todo += [(p_, QM['addr'], PT['addr']) for p_ in 'D' if p_ in which]
+                todo += [(p_, QM['char'], PT['char']) for p_ in 'I' if p_ in which]
+                if 'F' in which:
+                    todo.append(('F', sp.hstack([QM['name'] * alpha, QM['addr'] * (1 - alpha)], format='csr'), PT['comb']))
+                for p_, Qx, PTx in todo:
+                    cc_, vv, nn = spmm_topk(Qx, PTx, k)
+                    r = np.repeat(np.arange(len(qi)), nn)
+                    j = np.arange(len(r)) - np.repeat(np.cumsum(nn) - nn, nn)          # rank within the query
+                    out[p_].append(pd.DataFrame({'qi': qi[r].astype(np.int32), 'pi': (cc_[r, j].astype(np.int64) + ps).astype(np.int32),
+                                                 'score': vv[r, j], 'rank': j.astype(np.int16)}))
+                pg.update(min(s + pchunk, len(rows_c)), force=True)
+            log(f'   sparse {which} [{c}] {len(rows_c):,} q x {pe - ps:,} pool: {time.time() - t:.0f}s')
+            del PT
+            gc.collect()
+            continue
         for s in range(0, len(rows_c), chunk):
             qi = rows_c[s:s + chunk]
             SC = {f: (retr_mat(Qm, qi, RETR_FIELDS[f], R['W'], 'q', bm25) @ PT[f]).tocsr() for f in PT}
@@ -239,8 +314,7 @@ def union_candidates(pass_dfs, K_sel, n_pool, scores=True):
         bits.append(np.full(len(d), PASS_BITS[p], np.uint16))
     keys, bits = np.concatenate(keys), np.concatenate(bits)
     uk, inv = np.unique(keys, return_inverse=True)
-    ob = np.zeros(len(uk), np.uint16)
-    np.bitwise_or.at(ob, inv.ravel(), bits)
+    ob = np.bincount(inv.ravel(), weights=bits, minlength=len(uk)).astype(np.uint16)   # distinct pass bits: sum == OR
     out = pd.DataFrame({'qi': (uk // n_pool).astype(np.int32), 'pi': (uk % n_pool).astype(np.int32), 'bits': ob})
     if scores:
         for p, d in kept.items():

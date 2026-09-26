@@ -28,6 +28,8 @@ GROUPS = {
               'a_ratio', 'a_tset', 'a_tsort', 'a_partial'),
     'embeddings': ('embG', 'embS', 'blk_G', 'blk_S'),
     'noise_flags': ('q_f_', 'p_f_'),
+    'fe2': ('fe_',),                       # day-2 block (unmatched tokens, legal form, name numbers, duplicates, pool ranks)
+    'fe2_pool': ('fe_p_',),                # its within-pool-record ranks only
 }
 
 
@@ -147,7 +149,7 @@ def stage1_ctxs(cfg, W, pdfs, blk, plan, S1, info, prms, key):
         if len(prms) == 1:
             cand, F = cand_u, F_u
         else:
-            cand, F = PL.subset_context(cand_u, F_u, np.flatnonzero(mk[U]), plan['passes'])
+            cand, F = PL.subset_context(cand_u, F_u, np.flatnonzero(mk[U]), plan['passes'], PL.pool_feats_on(cfg))
         y = PL.label_candidates(W, cand)
         keys = cand.qi.to_numpy(np.int64) * W['NP'] + cand.pi.to_numpy(np.int64)
         st = dict(key=S1['key'], cut=prm, info=info, model=S1['model'], cols=S1['cols'], imp=S1['imp'],

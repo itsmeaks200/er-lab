@@ -21,12 +21,46 @@ CTX = ['n_tok_cos', 'a_tok_cos', 'n_char_cos', 'comb', 'embG_cos', 'embS_cos']
 PARAMS = dict(num_leaves=63, learning_rate=0.08, min_data_in_leaf=200, feature_fraction=0.8, lambda_l2=1.0)
 
 
+def _seg_rank_gap_py(order, starts, v, rank, gap):
+    """Per group segment (rows order[starts[s]:starts[s+1]], in position order): stable rank by descending v and gap
+    to the segment max. Parallel over segments."""
+    for s in prange(len(starts) - 1):
+        a, b = starts[s], starts[s + 1]
+        n = b - a
+        vals = np.empty(n, np.float32)
+        for u in range(n):
+            vals[u] = v[order[a + u]]
+        o = np.argsort(-vals, kind='mergesort')
+        mx = vals[o[0]]
+        for r in range(n):
+            rank[order[a + o[r]]] = r + 1
+        for u in range(n):
+            gap[order[a + u]] = mx - vals[u]
+
+
+try:
+    import numba
+    from numba import prange
+    _seg_rank_gap = numba.njit(parallel=True, cache=True)(_seg_rank_gap_py)
+except Exception:
+    prange = range
+    _seg_rank_gap = None
+
+
 def group_rank_gap(g, v):
     """Within groups g: rank of v (1 = best, ties broken by position) and gap to the group max."""
     v = np.nan_to_num(np.asarray(v, np.float32), nan=-1.0)
     n = len(v)
     if n == 0:
         return np.empty(0, np.float32), np.empty(0, np.float32)
+    if _seg_rank_gap is not None:              # parallel path: one stable sort by group, then per-segment sorts
+        g = np.asarray(g)
+        order = np.arange(n) if np.all(g[1:] >= g[:-1]) else np.argsort(g, kind='stable')
+        gs = g[order]
+        starts = np.r_[0, np.flatnonzero(gs[1:] != gs[:-1]) + 1, n].astype(np.int64)
+        rank, gap = np.empty(n, np.float32), np.empty(n, np.float32)
+        _seg_rank_gap(order.astype(np.int64), starts, v, rank, gap)
+        return rank, gap
     order = np.lexsort((-v, g))
     gs = g[order]
     first = np.r_[True, gs[1:] != gs[:-1]]

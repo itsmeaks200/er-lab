@@ -39,7 +39,9 @@ DEFAULTS = {
         'k_keep': 0.995,
         'k_grid': [1, 2, 3, 5, 8, 10, 12, 15, 20, 25, 30, 40],
         'max_block': 300,
-        'greedy_min_gain': 0.0005,
+        'greedy_min_gain': 0.0001,    # smallest recall gain worth adding (the budget usually binds first)
+        'max_per_S1': 60,             # stage-0 budget: union of the chosen (pass, K) options, candidates per S1
+        'select_sample': 60_000,      # fit-fold S1 sampled for the pass/K choice (fast on the full world)
         'select': 'greedy',           # 'greedy' (fit-fold recall) | 'all'
     },
     'encoder': {'enabled': True, 'bucket_bits': 18, 'dim': 64, 'epochs': 10, 'batch': 2048, 'tau': 0.05, 'lr': 0.01},
@@ -56,7 +58,9 @@ DEFAULTS = {
         'm_grid': [0, 1, 2, 3],            # top-m S1 per pool record (0 = no cap; only with pool_ctx)
         'rounds': 2000, 'early_stop': 50, 'max_train_rows': 30_000_000, 'params': {},
     },
-    'feats': {'chunk': 1_000_000, 'prune': True, 'prune_max_loss': 0.001, 'version': 4},
+    'feats': {'chunk': 1_000_000, 'prune': True, 'prune_max_loss': 0.001, 'version': 4,
+              'fe2': False},             # day-2 feature block (unmatched-token IDF, legal form, name numbers, duplicate
+                                        # clusters; + within-pool-record ranks when prune1.pool_ctx)
     'model': {
         'kind': 'lgb',                # lgb | lgb_rank | xgb | cat | lr | mlp
         'params': {},                 # overrides of the per-kind defaults (models.py)

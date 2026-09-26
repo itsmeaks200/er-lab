@@ -61,7 +61,7 @@ def _tok_block(f, pre, A, B, qi, pi, R, space, rare=False, sizes=False, seteq=Fa
     return sh, na, nb
 
 
-def pair_features(qi, pi, W, emb=None, alpha=0.6):
+def pair_features(qi, pi, W, emb=None, alpha=0.6, fe2=False):
     """W: world dict with Q, P (frames), Qm, Pm (matrices), R (idf). emb: dict name -> (Qe, Pe) dense arrays."""
     Q_, P_, Qm_, Pm_, R = W['Q'], W['P'], W['Qm'], W['Pm'], W['R']
     f = {}
@@ -131,7 +131,98 @@ def pair_features(qi, pi, W, emb=None, alpha=0.6):
     f['src_s3'] = (P_.src.to_numpy()[pi] == 3).astype(np.float32)
     for name, (Qe, Pe) in (emb or {}).items():
         f[name + '_cos'] = (Qe[qi].astype(np.float32) * Pe[pi].astype(np.float32)).sum(1)
+    if fe2:
+        fe2_features(f, qi, pi, W)
     return pd.DataFrame(f)
+
+
+# ---------------------------------------------------------------- FE2: day-2 feature block (prefix fe_)
+LEGAL = {  # legal-form classes; each value is a word-boundary regex
+    'llc': r'\bllc\b',
+    'inc': r'\binc\b|\bincorporated\b',
+    'corp': r'\bcorp\b|\bcorporation\b',
+    'ltd': r'\bltd\b|\blimited\b',
+    'pvt': r'\bpvt\b|\bprivate\b',
+    'llp': r'\bllp\b',
+    'co': r'\bco\b|\bcompany\b',
+    'fr': r'\bsarl\b|\bsas\b|\bsa\b|\beurl\b|\bsci\b|\bsnc\b',
+    'soc': r'\btrust\b|\bfoundation\b|\bsociety\b',
+    'lp': r'\blp\b|\bpartners?\b',
+    'pc': r'\bpc\b|\bpllc\b|\bpa\b',
+}
+
+
+def _fe2_records(W, side):
+    """Per-record legal-form bitmask and the set of numbers in the name (cached on the world dict)."""
+    key = '_fe2_' + side
+    if key not in W:
+        s = (W['Q'] if side == 'Q' else W['P']).n_basic.astype(str)
+        mask = np.zeros(len(s), np.int32)
+        for j, rx in enumerate(LEGAL.values()):
+            mask |= s.str.contains(rx, regex=True).to_numpy(bool).astype(np.int32) << j
+        nums = s.str.findall(r'\d+').map(lambda l: ' '.join(sorted(set(l)))).to_numpy(object)
+        W[key] = (mask, nums)
+    return W[key]
+
+
+def _unmatched(f, pre, A, B, qi, pi, idf):
+    """IDF mass / max IDF of tokens present on one side only (distinctive extra words signal different entities)."""
+    a, b = A[qi].tocsr(), B[pi].tocsr()
+    a.data[:] = 1; b.data[:] = 1
+    inter = a.multiply(b).tocsr()
+    ish = inter @ idf
+    for tag, m in (('q', a), ('p', b)):
+        u = (m - inter).tocsr()
+        u.eliminate_zeros()
+        f[f'fe_{pre}_u{tag}_idf'] = (m @ idf - ish).astype(np.float32)
+        u.data = u.data * idf[u.indices]
+        f[f'fe_{pre}_u{tag}_max'] = np.asarray(u.max(axis=1).todense()).ravel().astype(np.float32)
+    f[f'fe_{pre}_u_minmax'] = np.minimum(f[f'fe_{pre}_uq_max'], f[f'fe_{pre}_up_max'])
+    f[f'fe_{pre}_u_maxmax'] = np.maximum(f[f'fe_{pre}_uq_max'], f[f'fe_{pre}_up_max'])
+
+
+def fe2_features(f, qi, pi, W):
+    Qm, Pm, R = W['Qm'], W['Pm'], W['R']
+    for pre, sp_ in (('ntok', 'ntok'), ('nskel', 'nskel'), ('atok', 'atok')):
+        _unmatched(f, pre, Qm[sp_], Pm[sp_], qi, pi, R['IDF'][sp_])
+    mq, nq = _fe2_records(W, 'Q')
+    mp, np_ = _fe2_records(W, 'P')
+    a, b = mq[qi], mp[pi]
+    both = (a > 0) & (b > 0)
+    f['fe_legal_both'] = both.astype(np.float32)
+    f['fe_legal_agree'] = np.where(both, ((a & b) > 0).astype(np.float32), np.nan).astype(np.float32)
+    f['fe_legal_conflict'] = (both & ((a & b) == 0)).astype(np.float32)
+    x, y = nq[qi], np_[pi]
+    has = np.fromiter((u != '' and v != '' for u, v in zip(x, y)), bool, count=len(x))
+    eq = np.full(len(x), np.nan, np.float32); conf = np.zeros(len(x), np.float32)
+    idx = np.flatnonzero(has)
+    if len(idx):
+        ov = np.fromiter((len(set(x[i].split()) & set(y[i].split())) for i in idx), np.float32, count=len(idx))
+        eq[idx] = (x[idx] == y[idx]).astype(np.float32)
+        conf[idx] = (ov == 0).astype(np.float32)
+    f['fe_namenum_eq'], f['fe_namenum_conflict'] = eq, conf
+    f['fe_namenum_one_side'] = np.fromiter(((u != '') != (v != '') for u, v in zip(x, y)), np.float32, count=len(x))
+    # duplicate clusters inside the S1's candidate list (S2/S3 are not deduplicated internally)
+    core = W['P'].n_core.to_numpy()[pi]
+    src = W['P'].src.to_numpy()[pi]
+    df = pd.DataFrame({'q': qi, 'c': core, 's': src})
+    f['fe_dup_name_same_src'] = (df.groupby(['q', 's', 'c']).q.transform('size').to_numpy() - 1).astype(np.float32)
+    f['fe_dup_name_any_src'] = (df.groupby(['q', 'c']).q.transform('size').to_numpy() - 1).astype(np.float32)
+
+
+POOL_CTX = ['name_x_addr', 'n_tset', 'comb_cos', 'embS_cos', 'pr_p', 'a_tset']
+
+
+def add_pool_context(F, pi):
+    """Within-pool-record ranks across the S1 entities that have this record as a candidate (unique-assignment law).
+    Needs every S1 of the split in the world (train: full S1 set; test: always)."""
+    from .prune import group_rank_gap
+    pi = np.asarray(pi)
+    F['fe_p_ncand'] = np.bincount(pi)[pi].astype(np.float32)
+    for c in POOL_CTX:
+        if c in F:
+            F[f'fe_p_{c}_rank'], F[f'fe_p_{c}_gap'] = group_rank_gap(pi, F[c].to_numpy())
+    return F
 
 
 GROUP_BASE = ['n_tset', 'n_char_cos', 'n_tok_wjacc', 'a_tset', 'a_tok_cos', 'comb_cos', 'name_x_addr',
@@ -158,7 +249,7 @@ def add_context(F, qi, bits, passes):
 
 
 def drop_context(F):
-    return F.drop(columns=[c for c in F.columns if c.startswith(CTX_PREFIX) or c.endswith(CTX_SUFFIX) or c == 'q_ncand'])
+    return F.drop(columns=[c for c in F.columns if c.startswith(CTX_PREFIX) or c.endswith(CTX_SUFFIX) or c in ('q_ncand', 'fe_p_ncand')])
 
 
 def safe_zone(F):
@@ -180,7 +271,7 @@ def group_chunks(qi_sorted, chunk):
 
 
 def compute_features(cand, W, passes, emb=None, prune=False, chunk=1_000_000, scorer=None, keep_cols=None, alpha=0.6,
-                     extra=None):
+                     extra=None, fe2=False):
     """scorer=None → (features, keep mask); else streams: (scores, keep mask, kept columns frame).
     extra: {column: array aligned with cand} appended as features (e.g. the stage-1 pruner score pr_p)."""
     qi_all, pi_all, bits_all = cand.qi.to_numpy(), cand.pi.to_numpy(), cand.bits.to_numpy()
@@ -188,7 +279,7 @@ def compute_features(cand, W, passes, emb=None, prune=False, chunk=1_000_000, sc
     outs, kept = [], []
     bounds = group_chunks(qi_all, chunk)
     for j, (s, e) in enumerate(bounds):
-        F = pair_features(qi_all[s:e], pi_all[s:e], W, emb, alpha)
+        F = pair_features(qi_all[s:e], pi_all[s:e], W, emb, alpha, fe2)
         for c, v in (extra or {}).items():
             F[c] = np.asarray(v[s:e], np.float32)
         if prune:
