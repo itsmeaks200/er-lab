@@ -60,8 +60,8 @@ python -m pip install -r requirements.txt          # adds peft, accelerate, bits
 python -c "import peft, bitsandbytes; print('peft', peft.__version__, 'bnb', bitsandbytes.__version__)"
 Start-Process python -ArgumentList 'run.py','day2' -RedirectStandardOutput day2.log -RedirectStandardError day2.err -WindowStyle Hidden
 ```
-SUB7 → SUB8 → SUB9 → M10F → SUB10 → SUB12 → SUMMARY → SUB11 → SUB13 → SUMMARY: FE2 feature block, Qwen2.5-1.5B LoRA judge,
-Qwen2.5-7B 4-bit QLoRA judge (downloads ~15 GB once), stacks of all text models. Same outputs as the overnight run
+SUB14 → SUB9 → SUB15 → SUB8 → SUMMARY → M10F → SUB11 → SUB16 → SUMMARY: FE2 features, e5-small cross-encoder on ALL
+candidates, Qwen2.5-1.5B LoRA judge, Qwen2.5-7B 4-bit QLoRA judge (downloads ~15 GB once), stacks of the text models. Same outputs as the overnight run
 (`results/submissions/<ID>/`, SUMMARY.csv, PASTE_BACK.md). If bitsandbytes fails to import, SUB11/SUB13 fail and the rest runs.
 
 ## Step 3+: the real waves (only when I say which one)

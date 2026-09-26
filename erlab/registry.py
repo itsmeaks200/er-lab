@@ -163,16 +163,47 @@ EXPERIMENTS.update({
                                                                       'context', 'numeric_postal', 'noise_flags'])),
 })
 
+# Day-1 findings (full data): the e5-small cross-encoder gave +0.0043 on top of stage 2 (SUB4 0.9888) but scored only
+# 3.1M of ~7.7M in-scope pairs; e5-large with less coverage/training was worse (SUB5 0.9877); GBDT averaging and Optuna
+# did not help (SUB2/SUB6). So day 2 = text models with FULL coverage + FE2, then LLM judges, then stacks.
+CE_SMALL_ALL = {'crossenc': {'enabled': True, 'model': 'intfloat/multilingual-e5-small', 'max_len': 96, 'batch': 256, 'lr': 3e-5,
+                             'epochs': 2, 'max_train_pairs': 4_000_000, 'band': [0.0, 1.0], 'top_n': 50, 'max_pred_pairs': 0,
+                             'train_minutes': 90, 'pred_batch': 1024}}
+EXPERIMENTS.update({
+    'SUB14': dict(wave=6, kind='submit', desc='A14: A8 (stage 2 + FE2) + e5-small cross-encoder, 2 epochs, scoring ALL candidates',
+                  cfg=_deep(FULL, FE2, CE_SMALL_ALL), args=dict(_S2, crossenc=True)),
+    'SUB15': dict(wave=6, kind='submit', desc='A15: A14 + Qwen2.5-1.5B judge (two text scores stacked; both cached)',
+                  cfg=_deep(FULL, FE2, CE_SMALL_ALL), args=dict(_S2, crossenc=True, extra_crossenc=[QWEN15['crossenc']])),
+    'SUB16': dict(wave=6, kind='submit', desc='A16: A15 + Qwen2.5-7B QLoRA judge (three text scores stacked)',
+                  cfg=_deep(FULL, FE2, CE_SMALL_ALL), args=dict(_S2, crossenc=True,
+                                                               extra_crossenc=[QWEN15['crossenc'], QWEN7['crossenc']])),
+})
+
+# Day-1 findings (full data): the e5-small cross-encoder gave +0.0043 on top of stage 2 (SUB4 0.9888) but scored only
+# 3.1M of ~7.7M in-scope pairs; e5-large with less coverage/training was worse (SUB5 0.9877); GBDT averaging and Optuna
+# did not help (SUB2/SUB6). So day 2 = text models with FULL coverage + FE2, then LLM judges, then stacks.
+CE_SMALL_ALL = {'crossenc': {'enabled': True, 'model': 'intfloat/multilingual-e5-small', 'max_len': 96, 'batch': 256, 'lr': 3e-5,
+                             'epochs': 2, 'max_train_pairs': 4_000_000, 'band': [0.0, 1.0], 'top_n': 50, 'max_pred_pairs': 0,
+                             'train_minutes': 90, 'pred_batch': 1024}}
+EXPERIMENTS.update({
+    'SUB14': dict(wave=6, kind='submit', desc='A14: A8 (stage 2 + FE2) + e5-small cross-encoder, 2 epochs, scoring ALL candidates',
+                  cfg=_deep(FULL, FE2, CE_SMALL_ALL), args=dict(_S2, crossenc=True)),
+    'SUB15': dict(wave=6, kind='submit', desc='A15: A14 + Qwen2.5-1.5B judge (two text scores stacked; both cached)',
+                  cfg=_deep(FULL, FE2, CE_SMALL_ALL), args=dict(_S2, crossenc=True, extra_crossenc=[QWEN15['crossenc']])),
+    'SUB16': dict(wave=6, kind='submit', desc='A16: A15 + Qwen2.5-7B QLoRA judge (three text scores stacked)',
+                  cfg=_deep(FULL, FE2, CE_SMALL_ALL), args=dict(_S2, crossenc=True,
+                                                               extra_crossenc=[QWEN15['crossenc'], QWEN7['crossenc']])),
+})
+
 DAY2 = dict(
-    ids=['SUB7',        # FE2 on the LightGBM matcher (compare with SUB1)
-         'SUB8',        # FE2 on the stage-2 reranker (compare with SUB3)
-         'SUB9',        # + Qwen2.5-1.5B judge
-         'M10F',        # which feature groups matter
-         'SUB10',       # e5-small + Qwen1.5B stacked (both cached -> cheap)
-         'SUB12',       # GBDT trio with tuned LightGBM + FE2
+    ids=['SUB14',       # FE2 + stage 2 + e5-small on ALL candidates        (expected best; first valid submission)
+         'SUB9',        # FE2 + stage 2 + Qwen2.5-1.5B judge (uncertain pairs)
+         'SUB15',       # e5-small (all) + Qwen1.5B stacked                 (both cached -> ~1 h)
+         'SUB8',        # FE2 + stage 2, no text model                      (ablation vs SUB3)
          'SUMMARY',
-         'SUB11',       # Qwen2.5-7B QLoRA (slowest)
-         'SUB13',       # all text scores stacked (all cached -> cheap)
+         'M10F',        # which feature groups matter
+         'SUB11',       # Qwen2.5-7B QLoRA judge (slowest; needs bitsandbytes)
+         'SUB16',       # all three text scores stacked                     (cached -> ~1 h)
          'SUMMARY'],
     sets=['world.n_s1_sample=1000000000', 'st.enabled=True', 'prune1.enabled=True', 'prune1.pool_ctx=True', 'feats.fe2=True'],
 )
